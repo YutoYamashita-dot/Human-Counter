@@ -2,7 +2,7 @@
 import OpenAI from "openai";
 import { z } from "zod";
 
-export const config = { runtime: "nodejs18.x" };
+export const config = { runtime: "nodejs" };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
