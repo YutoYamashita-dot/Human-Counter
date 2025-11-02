@@ -1,0 +1,10 @@
+{
+  "name": "ningen-hunter",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "openai": "^4.0.0",
+    "zod": "^3.23.8",
+    "cors": "^2.8.5"
+  }
+}
