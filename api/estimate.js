@@ -7,7 +7,7 @@ export const config = { runtime: "nodejs" };
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // --- タイムアウト（ms）
-const TIMEOUT_MS = 6000;
+const TIMEOUT_MS = 100000;
 
 const Schema = z.object({
   address: z.string().min(1).max(200),
