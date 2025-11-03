@@ -63,13 +63,15 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Invalid input", details: parsed.error.issues });
 
     const { address, crowd, feature, radius_m } = parsed.data;
+
     if (!process.env.OPENAI_API_KEY)
       return res.status(200).json({ count: 0, confidence: 0, range: {min:0,max:0}, assumptions: [], notes: [] });
 
     const prompt = buildPrompt({ address, crowd, feature, radius_m });
+
     const resp = await client.chat.completions.create({
       model: "gpt-5",
-      temperature: 0.4,
+      // temperature: 0.4, // ← モデル非対応のため削除（デフォルト=1）
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "Return strict JSON only." },
