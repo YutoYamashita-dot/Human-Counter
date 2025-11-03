@@ -103,7 +103,7 @@ async function callOpenAIWithTimeout(messages, signal) {
     model: "gpt-5",
     messages,
     temperature: 1,
-    max_tokens: 400
+    max_completion_tokens: 400
   }, { signal });
   console.log("[estimate] raw OpenAI response:", JSON.stringify(resp, null, 2)?.slice(0, 800)); // ログを抑制
   return resp;
