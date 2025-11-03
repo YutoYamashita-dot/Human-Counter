@@ -66,7 +66,7 @@ function buildPrompt({ address, crowd, feature, radius_m }, targetLang = "en", n
   // crowd は internal ("empty" | "normal" | "crowded") をそのまま使う
   // assumptions / notes は targetLang で。JSONキーは固定・数値は実数。
   // ★ 重要ルールに「国籍で絞らない（all）」を明記。明示指定がある場合のみ絞り込み。
-  return `You are a strict estimator. Output ONLY JSON, no prose.
+  return `You are an estimator. Output ONLY JSON, no prose.
 
 JSON schema (keys and types are fixed):
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
