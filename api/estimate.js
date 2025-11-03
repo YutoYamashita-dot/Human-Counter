@@ -1,10 +1,13 @@
+
+
 // api/estimate.js  (Vercel Node.js Serverless Function)
 import { z } from "zod";
 
 export const config = { runtime: "nodejs" };
 
-// ChatGPT API エンドポイント
-const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
+// xAI API エンドポイント＆モデル
+const XAI_URL = "https://api.x.ai/v1/chat/completions";
+const XAI_MODEL = "grok-4-fast-reasoning"; // 例: grok-2-latest / grok-2-mini 等
 const TIMEOUT_MS = 30000;
 
 // --- スキーマ定義（変更なし） ---
@@ -34,7 +37,7 @@ function looseNormalize(input = {}) {
 
 function buildPrompt({ address, crowd, feature, radius_m }) {
   const crowdJP = { empty: "空いている", normal: "普通", crowded: "混雑" }[crowd];
-  return `You are a strict estimator.
+  return `You are an strict estimator.
 Output ONLY valid JSON with this structure:
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
@@ -96,60 +99,57 @@ function neutralEstimate({ radius_m, crowd }) {
   };
 }
 
-// --- ChatGPT呼び出し：モデル強制＆多段フォールバック（gpt-4o-mini → gpt-4o × RFあり/なし）
-async function callChatGPTWithTimeout(messages, signal) {
-  if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+// --- xAI呼び出し（JSONパラメータ差異にフォールバック対応・詳細ログ付き）
+async function callXAIWithTimeout(messages, signal) {
+  if (!process.env.XAI_API_KEY) throw new Error("Missing XAI_API_KEY");
   const headers = {
-    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "Authorization": `Bearer ${process.env.XAI_API_KEY}`,
     "Content-Type": "application/json"
   };
 
-  // 試行バリエーション（順に試す）
-  const variants = [
-    { model: "gpt-4o-mini", withRF: true  },
-    { model: "gpt-4o-mini", withRF: false }
-  ];
+  // 1回目: max_output_tokens を優先（xAI推奨）
+  const body1 = {
+    model: XAI_MODEL,
+    messages,
+    temperature: 1,
+    max_output_tokens: 400
+  };
+  console.log("[estimate] calling xAI (max_output_tokens)...");
+  let resp = await fetch(XAI_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body1),
+    signal
+  });
 
-  let lastJson = null;
-  for (const v of variants) {
-    const body = {
-      model: v.model,
-      messages,
-      max_completion_tokens: 400,
-      ...(v.withRF ? { response_format: { type: "json_object" } } : {})
-    };
-    console.log(`[estimate] calling ChatGPT (${v.model}, RF=${v.withRF})...`);
-
-    const resp = await fetch(OPENAI_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal
-    });
-
-    const json = await resp.json().catch(() => ({}));
-    lastJson = json;
-    console.log("[estimate] raw ChatGPT response:", JSON.stringify(json)?.slice(0, 800));
-
-    // HTTPエラー → 次バリアントへ
-    if (!resp.ok) {
-      console.error("[estimate] ChatGPT error:", json?.error?.message || resp.status);
-      continue;
+  // もし xAI 側がパラメータ非対応で 400 を返したら max_tokens に切替
+  if (!resp.ok) {
+    const txt = await resp.text();
+    console.error("[estimate] xAI first call error:", txt);
+    if (resp.status === 400 && /max_output_tokens/i.test(txt)) {
+      const body2 = {
+        model: XAI_MODEL,
+        messages,
+        temperature: 1,
+        max_tokens: 400
+      };
+      console.log("[estimate] retry xAI (max_tokens)...");
+      resp = await fetch(XAI_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body2),
+        signal
+      });
     }
-
-    const content = json?.choices?.[0]?.message?.content ?? "";
-    console.log("[estimate] content:", content);
-    if (typeof content === "string" && content.trim().length > 0) {
-      return content; // ここで content を返す（上位でJSON化）
-    }
-
-    // content 空 → 次のバリアント
-    console.warn("[estimate] empty content, trying next variant...");
   }
 
-  // 全部ダメなら null を返す（上位で中立推定へ）
-  console.warn("[estimate] all variants failed; returning null");
-  return null;
+  const json = await resp.json().catch(() => ({}));
+  console.log("[estimate] raw xAI response:", JSON.stringify(json)?.slice(0, 800));
+  if (!resp.ok) {
+    const msg = json?.error?.message || `xAI error: ${resp.status}`;
+    throw new Error(msg);
+  }
+  return json;
 }
 
 export default async function handler(req, res) {
@@ -176,8 +176,9 @@ export default async function handler(req, res) {
     const input = parsed.success ? parsed.data : looseNormalize(incoming);
     console.log("[estimate] input:", input);
 
-    if (!process.env.OPENAI_API_KEY) {
-      console.warn("[estimate] missing OPENAI_API_KEY");
+    // APIキー未設定でも 200 で中立推定
+    if (!process.env.XAI_API_KEY) {
+      console.warn("[estimate] missing XAI_API_KEY");
       return res.status(200).json(neutralEstimate(input));
     }
 
@@ -189,11 +190,14 @@ export default async function handler(req, res) {
     ];
 
     const execOnce = async (signal) => {
-      const content = await callChatGPTWithTimeout(messages, signal);
-      let data = content ? tryParseJSON(content) : null;
+      const xres = await callXAIWithTimeout(messages, signal);
+      const content = xres?.choices?.[0]?.message?.content ?? "";
+      console.log("[estimate] content:", content);
+      let data = tryParseJSON(content);
       console.log("[estimate] parsed data:", data);
+      if (!data) data = tryParseJSON(String(content));
       if (!data) {
-        console.warn("[estimate] parse failed or empty content, neutral estimate used");
+        console.warn("[estimate] parse failed, neutral estimate used");
         return neutralEstimate(input);
       }
       const normalized = normalizeResult(data);
@@ -233,3 +237,4 @@ export default async function handler(req, res) {
     return res.status(200).json(neutral);
   }
 }
+
