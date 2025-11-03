@@ -25,9 +25,8 @@ function sanitizeFeature(txt = "") {
 // ---- プロンプト生成
 function buildPrompt({ address, crowd, feature, radius_m }) {
   const crowdJP = { empty: "空いている", normal: "普通", crowded: "混雑" }[crowd];
-  return `You are a humorous but careful estimator. The user gives a location (coarse), crowd level, an entertainment "feature", and a radius in meters.
+  return `You are a careful estimator. The user gives a location (coarse), crowd level, an entertainment "feature", and a radius in meters.
 Estimate how many people within the radius might match that feature.
-Use only general, public, harmless heuristics.
 
 Return strict JSON with keys:
 - "count": number | null
@@ -43,7 +42,7 @@ crowd="${crowdJP}" (internal=${crowd})
 feature="${feature}"
 radius_m=${radius_m}
 
-Make the estimate playful but safe. Output JSON only.`;
+Make the estimate stirictly. Output JSON only.`;
 }
 
 export default async function handler(req, res) {
