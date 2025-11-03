@@ -35,7 +35,7 @@ function looseNormalize(input = {}) {
 
 function buildPrompt({ address, crowd, feature, radius_m }) {
   const crowdJP = { empty: "空いている", normal: "普通", crowded: "混雑" }[crowd];
-  return `You are an estimator.
+  return `You are an strict estimator.
 Output ONLY valid JSON with this structure:
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
