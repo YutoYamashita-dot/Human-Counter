@@ -39,7 +39,7 @@ function looseNormalize(input = {}) {
 function buildPrompt({ address, crowd, feature, radius_m }) {
   const crowdJP = { empty: "空いている", normal: "普通", crowded: "混雑" }[crowd];
   return `You are an entertainment estimator.
-Return strict JSON only with the shape:
+Output ONLY valid JSON with the shape:
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
 address="${address}"
@@ -47,7 +47,7 @@ crowd="${crowdJP}" (internal=${crowd})
 feature="${feature}"
 radius_m=${radius_m}
 
-Keep it playful but plausible. JSON only.`;
+Be humorous but consistent. JSON only.`;
 }
 
 // --- “最終整形” ユーティリティ（欠損を静かに補完）
@@ -109,16 +109,17 @@ function neutralEstimate({ radius_m, crowd }) {
     confidence: 0.55,
     range: { min: Math.max(0, est - spread), max: est + spread },
     assumptions: ["Heuristic estimate used."],
-    notes: ["Upstream result unavailable; provided a neutral estimate."]
+    notes: ["Upstream result unavailable; neutral estimate provided."]
   };
 }
 
+// ✅ OpenAI 呼び出し部を修正：json_object指定を外して確実にcontentを取得
 async function callOpenAIWithTimeout(messages, signal) {
   const resp = await client.chat.completions.create({
     model: "gpt-5",
-    response_format: { type: "json_object" },
     messages,
-    max_tokens: 300
+    temperature: 1,
+    max_tokens: 400
   }, { signal });
   return resp;
 }
@@ -135,7 +136,7 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   try {
-    // ボディ正規化（文字/オブジェクト両対応・radiusエイリアス対応）
+    // ボディ正規化
     let body = req.body;
     if (typeof body === "string") {
       try { body = JSON.parse(body); } catch { body = {}; }
@@ -143,19 +144,16 @@ export default async function handler(req, res) {
     if (!body || typeof body !== "object") body = {};
     const incoming = { ...body, radius_m: body?.radius_m ?? body?.radius };
 
-    // まず厳格に
     let parsed = Schema.safeParse(incoming);
-    // 失敗しても API にできるだけ投げる（緩い補完で再構成）
     const input = parsed.success ? parsed.data : looseNormalize(incoming);
 
-    // APIキー未設定 → それでも数値を返す（“fallback”文言なし）
     if (!process.env.OPENAI_API_KEY) {
       return res.status(200).json(neutralEstimate(input));
     }
 
     const prompt = buildPrompt(input);
     const messages = [
-      { role: "system", content: "Return strict JSON only." },
+      { role: "system", content: "Return JSON only." },
       { role: "user", content: prompt }
     ];
 
@@ -163,16 +161,9 @@ export default async function handler(req, res) {
     const execOnce = async (signal) => {
       const resp = await callOpenAIWithTimeout(messages, signal);
       const content = resp?.choices?.[0]?.message?.content ?? "";
-      // まず通常パース（json_object指定の想定）
       let data = tryParseJSON(content);
-      if (!data) {
-        // モデルが余計な説明を返した場合でも拾う
-        data = tryParseJSON(String(content));
-      }
-      if (!data) {
-        // それでもダメなら最終保険（ただし“fallback”語は使わない）
-        return neutralEstimate(input);
-      }
+      if (!data) data = tryParseJSON(String(content));
+      if (!data) return neutralEstimate(input);
       return normalizeResult(data);
     };
 
@@ -184,26 +175,19 @@ export default async function handler(req, res) {
       return res.status(200).json(out1);
     } catch (e1) {
       clearTimeout(timer);
-      // タイムアウト/一時エラーはリトライ（別Signal）
       try {
         const out2 = await execOnce(undefined);
         return res.status(200).json(out2);
       } catch (e2) {
-        // どうしても無理なら中立推定（“fallback”は書かない）
         return res.status(200).json(neutralEstimate(input));
       }
     }
   } catch (err) {
     console.error("Handler error:", err);
-    // 予期しない例外でも 200 + 中立推定
-    try {
-      const b = req?.body || {};
-      const r = Number(b?.radius_m ?? b?.radius ?? 500) || 500;
-      const c = (b?.crowd === "混雑" || b?.crowd === "crowded") ? "crowded"
-            : (b?.crowd === "普通" || b?.crowd === "normal") ? "normal" : "empty";
-      return res.status(200).json(neutralEstimate({ radius_m: r, crowd: c, address: "", feature: "" }));
-    } catch {
-      return res.status(200).json(neutralEstimate({ radius_m: 500, crowd: "normal", address: "", feature: "" }));
-    }
+    const b = req?.body || {};
+    const r = Number(b?.radius_m ?? b?.radius ?? 500) || 500;
+    const c = (b?.crowd === "混雑" || b?.crowd === "crowded") ? "crowded"
+          : (b?.crowd === "普通" || b?.crowd === "normal") ? "normal" : "empty";
+    return res.status(200).json(neutralEstimate({ radius_m: r, crowd: c, address: "", feature: "" }));
   }
 }
