@@ -117,7 +117,6 @@ async function callChatGPTWithTimeout(messages, signal) {
     const body = {
       model: v.model,
       messages,
-      temperature: 1,
       max_completion_tokens: 400,
       ...(v.withRF ? { response_format: { type: "json_object" } } : {})
     };
