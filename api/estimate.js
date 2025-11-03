@@ -106,8 +106,6 @@ async function callChatGPTWithTimeout(messages, signal) {
 
   // 試行バリエーション（順に試す）
   const variants = [
-    { model: "gpt-5", withRF: true  },
-    { model: "gpt-5", withRF: false },
     { model: "gpt-4o-mini", withRF: true  },
     { model: "gpt-4o-mini", withRF: false }
   ];
