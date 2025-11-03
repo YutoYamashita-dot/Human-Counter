@@ -6,9 +6,10 @@ export const config = { runtime: "nodejs" };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- タイムアウト（ms）
-const TIMEOUT_MS = 100000;
+// --- タイムアウト（ms）: 20秒に延長
+const TIMEOUT_MS = 20000;
 
+// --- 入力バリデーション
 const Schema = z.object({
   address: z.string().min(1).max(200),
   crowd: z.enum(["空いている", "普通", "混雑"]).transform(v =>
@@ -41,27 +42,36 @@ radius_m=${radius_m}
 Be humorous and plausible, output strict JSON only.`;
 }
 
-// --- 失敗/タイムアウト時のフォールバック（超簡易ヒューリスティック）
+// --- 失敗時のフォールバック（“timeout”文言は出さない）
 function fallbackEstimate({ radius_m, crowd }) {
-  // 半径[m]から面積[km^2]を概算 → 密度に crowd 係数
   const r_km = Math.max(0, radius_m) / 1000;
   const area = Math.PI * r_km * r_km;
-  const crowdFactor = crowd === "crowded" ? 2 : crowd === "normal" ? 1.0 : 0.4;
-  const baseDensity = 400; // 便宜的な基準人/km^2（エンタメ用途の仮数）
+  const crowdFactor = crowd === "crowded" ? 1.8 : crowd === "normal" ? 1.0 : 0.5;
+  const baseDensity = 400;
   const est = Math.max(0, Math.round(area * baseDensity * crowdFactor));
-  const spread = Math.round(est * 0.4 + 20); // ざっくり±40%幅
-
+  const spread = Math.round(est * 0.4 + 20);
   return {
     count: est,
     confidence: 0.35,
     range: { min: Math.max(0, est - spread), max: est + spread },
     assumptions: [
-      "Fallback estimate (timeout).",
+      "Heuristic fallback estimate.",
       "Uniform average density assumed.",
       `Crowd factor=${crowdFactor}`
     ],
-    notes: ["Result returned without model due to timeout."]
+    notes: ["Returned fallback due to upstream unavailability."]
   };
+}
+
+async function callOpenAIWithTimeout(messages, signal) {
+  const resp = await client.chat.completions.create({
+    model: "gpt-5",
+    // temperature: 1 (デフォルト。明示指定不可モデルのため指定しない)
+    response_format: { type: "json_object" },
+    messages,
+    max_tokens: 300
+  }, { signal });
+  return resp;
 }
 
 export default async function handler(req, res) {
@@ -94,30 +104,24 @@ export default async function handler(req, res) {
 
     // APIキー未設定 → 即フォールバック
     if (!process.env.OPENAI_API_KEY) {
-      const fb = fallbackEstimate({ radius_m, crowd });
-      return res.status(200).json(fb);
+      return res.status(200).json(fallbackEstimate({ radius_m, crowd }));
     }
 
     const prompt = buildPrompt({ address, crowd, feature, radius_m });
+    const messages = [
+      { role: "system", content: "Return strict JSON only." },
+      { role: "user", content: prompt }
+    ];
 
-    // ---- タイムアウト制御（AbortController）
+    // ---- AbortController でハードタイムアウト
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(new Error("timeout")), TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(new Error("timeout")), TIMEOUT_MS);
 
-    let data;
     try {
-      const resp = await client.chat.completions.create({
-        model: "gpt-5",
-        // temperature: 1 (デフォルト) — このモデルは明示指定不可
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: "Return strict JSON only." },
-          { role: "user", content: prompt }
-        ],
-        max_tokens: 300
-      }, { signal: controller.signal }); // ← ここで中断可能
-      clearTimeout(timeoutId);
-
+      // 1回目
+      const resp = await callOpenAIWithTimeout(messages, controller.signal);
+      clearTimeout(timer);
+      let data;
       try {
         data = JSON.parse(resp.choices[0].message.content);
       } catch {
@@ -125,10 +129,42 @@ export default async function handler(req, res) {
       }
       return res.status(200).json(data);
     } catch (e) {
-      clearTimeout(timeoutId);
-      // タイムアウト or 途中失敗 → フォールバックで 200
-      const fb = fallbackEstimate({ radius_m, crowd });
-      return res.status(200).json(fb);
+      clearTimeout(timer);
+
+      // タイムアウトなら 1 回だけリトライ（少し長めの猶予）
+      const isAbort = (e?.name === "AbortError") || String(e?.message || "").includes("timeout");
+      if (isAbort) {
+        const controller2 = new AbortController();
+        const timer2 = setTimeout(() => controller2.abort(new Error("timeout")), TIMEOUT_MS);
+        try {
+          const resp2 = await callOpenAIWithTimeout(messages, controller2.signal);
+          clearTimeout(timer2);
+          let data2;
+          try {
+            data2 = JSON.parse(resp2.choices[0].message.content);
+          } catch {
+            data2 = { count: 0, confidence: 0, range: { min: 0, max: 0 }, assumptions: [], notes: ["Parse error fallback."] };
+          }
+          return res.status(200).json(data2);
+        } catch {
+          clearTimeout(timer2);
+          return res.status(200).json(fallbackEstimate({ radius_m, crowd }));
+        }
+      }
+
+      // タイムアウト以外の一時エラーは 1 回だけリトライ
+      try {
+        const resp3 = await callOpenAIWithTimeout(messages, undefined);
+        let data3;
+        try {
+          data3 = JSON.parse(resp3.choices[0].message.content);
+        } catch {
+          data3 = { count: 0, confidence: 0, range: { min: 0, max: 0 }, assumptions: [], notes: ["Parse error fallback."] };
+        }
+        return res.status(200).json(data3);
+      } catch {
+        return res.status(200).json(fallbackEstimate({ radius_m, crowd }));
+      }
     }
   } catch (err) {
     console.error("Handler error:", err);
