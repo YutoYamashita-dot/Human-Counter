@@ -3,9 +3,8 @@ import { z } from "zod";
 
 export const config = { runtime: "nodejs" };
 
-// ChatGPT API エンドポイント＆モデル
+// ChatGPT API エンドポイント
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
-const OPENAI_MODEL = "gpt-5"; // JSON対応で安定
 const TIMEOUT_MS = 30000;
 
 // --- スキーマ定義（変更なし） ---
@@ -44,7 +43,7 @@ crowd="${crowdJP}" (internal=${crowd})
 feature="${feature}"
 radius_m=${radius_m}
 
-Be humorous but consistent. JSON only.`;
+JSON only.`;
 }
 
 function normalizeResult(data) {
@@ -97,7 +96,7 @@ function neutralEstimate({ radius_m, crowd }) {
   };
 }
 
-// --- ChatGPT呼び出し（OpenAI API） ---
+// --- ChatGPT呼び出し：モデル強制＆多段フォールバック（gpt-4o-mini → gpt-4o × RFあり/なし）
 async function callChatGPTWithTimeout(messages, signal) {
   if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
   const headers = {
@@ -105,28 +104,55 @@ async function callChatGPTWithTimeout(messages, signal) {
     "Content-Type": "application/json"
   };
 
-  const body = {
-    model: OPENAI_MODEL,
-    messages,
-    max_completion_tokens: 400,
-    response_format: { type: "json_object" }
-  };
+  // 試行バリエーション（順に試す）
+  const variants = [
+    { model: "gpt-5", withRF: true  },
+    { model: "gpt-5", withRF: false },
+    { model: "gpt-4o-mini", withRF: true  },
+    { model: "gpt-4o-mini", withRF: false }
+  ];
 
-  console.log("[estimate] calling ChatGPT...");
-  const resp = await fetch(OPENAI_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal
-  });
+  let lastJson = null;
+  for (const v of variants) {
+    const body = {
+      model: v.model,
+      messages,
+      temperature: 1,
+      max_completion_tokens: 400,
+      ...(v.withRF ? { response_format: { type: "json_object" } } : {})
+    };
+    console.log(`[estimate] calling ChatGPT (${v.model}, RF=${v.withRF})...`);
 
-  const json = await resp.json().catch(() => ({}));
-  console.log("[estimate] raw ChatGPT response:", JSON.stringify(json)?.slice(0, 800));
-  if (!resp.ok) {
-    const msg = json?.error?.message || `ChatGPT error: ${resp.status}`;
-    throw new Error(msg);
+    const resp = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal
+    });
+
+    const json = await resp.json().catch(() => ({}));
+    lastJson = json;
+    console.log("[estimate] raw ChatGPT response:", JSON.stringify(json)?.slice(0, 800));
+
+    // HTTPエラー → 次バリアントへ
+    if (!resp.ok) {
+      console.error("[estimate] ChatGPT error:", json?.error?.message || resp.status);
+      continue;
+    }
+
+    const content = json?.choices?.[0]?.message?.content ?? "";
+    console.log("[estimate] content:", content);
+    if (typeof content === "string" && content.trim().length > 0) {
+      return content; // ここで content を返す（上位でJSON化）
+    }
+
+    // content 空 → 次のバリアント
+    console.warn("[estimate] empty content, trying next variant...");
   }
-  return json;
+
+  // 全部ダメなら null を返す（上位で中立推定へ）
+  console.warn("[estimate] all variants failed; returning null");
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -166,14 +192,11 @@ export default async function handler(req, res) {
     ];
 
     const execOnce = async (signal) => {
-      const openaiRes = await callChatGPTWithTimeout(messages, signal);
-      const content = openaiRes?.choices?.[0]?.message?.content ?? "";
-      console.log("[estimate] content:", content);
-      let data = tryParseJSON(content);
+      const content = await callChatGPTWithTimeout(messages, signal);
+      let data = content ? tryParseJSON(content) : null;
       console.log("[estimate] parsed data:", data);
-      if (!data) data = tryParseJSON(String(content));
       if (!data) {
-        console.warn("[estimate] parse failed, neutral estimate used");
+        console.warn("[estimate] parse failed or empty content, neutral estimate used");
         return neutralEstimate(input);
       }
       const normalized = normalizeResult(data);
