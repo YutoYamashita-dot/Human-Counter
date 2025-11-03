@@ -42,12 +42,6 @@ radius_m=${radius_m}
 Make the estimate conservative. Prefer under-claiming to over-claiming. Output JSON only.`;
 }
 
-// ---- 追加：センシティブ判定（既存前提）
-function isSensitiveFeature(txt = "") {
-  const t = String(txt).toLowerCase();
-  // ここは適宜調整：属性・疾病・政治など個人特性に触れる可能性があるキーワードを網羅
-  return /race|ethnicity|religion|sexual|gender identity|political|disease|medical|disability/.test(t);
-}
 
 export default async function handler(req, res) {
   // CORS
