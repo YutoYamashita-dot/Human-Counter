@@ -1,5 +1,3 @@
-
-
 // api/estimate.js  (Vercel Node.js Serverless Function)
 import { z } from "zod";
 
@@ -22,6 +20,25 @@ const Schema = z.object({
   radius_m: z.coerce.number().int().min(10).max(40_075_000)
 });
 
+// --- 言語判定（追加） ---
+function hasJapanese(s = "") {
+  return /[\u3040-\u30FF\u4E00-\u9FFF]/.test(String(s));
+}
+function detectTargetLang(req, body, input) {
+  // 優先度: 明示指定 > ヘッダー > 入力文字種 > 既定
+  const explicit = (body?.lang || body?.ui_lang || body?.locale || "").toString().toLowerCase();
+  if (explicit === "ja" || explicit === "en") return explicit;
+
+  const h = (req.headers?.["x-ui-lang"] || req.headers?.["accept-language"] || "").toString().toLowerCase();
+  if (h.startsWith("ja")) return "ja";
+  if (h.startsWith("en")) return "en";
+
+  if (hasJapanese(body?.crowd) || hasJapanese(body?.feature) || hasJapanese(body?.address)) return "ja";
+  if (hasJapanese(input?.address) || hasJapanese(input?.feature)) return "ja";
+
+  return "en";
+}
+
 function looseNormalize(input = {}) {
   const addr = String(input?.address ?? "").trim() || "unknown";
   const c = input?.crowd;
@@ -35,18 +52,28 @@ function looseNormalize(input = {}) {
   return { address: addr, crowd, feature, radius_m };
 }
 
-function buildPrompt({ address, crowd, feature, radius_m }) {
-  const crowdJP = { empty: "空いている", normal: "普通", crowded: "混雑" }[crowd];
-  return `You are an strict estimator.
-Output ONLY valid JSON with this structure:
+// --- プロンプト（言語対応 & 英語入力安定化のために内部コードを使用） ---
+function buildPrompt({ address, crowd, feature, radius_m }, targetLang = "en") {
+  // crowd は internal ("empty" | "normal" | "crowded") をそのまま使う
+  // assumptions / notes は targetLang で出す。JSONキーは固定・数値は実数。
+  return `You are a strict estimator. Output ONLY JSON, no prose.
+
+JSON schema (keys and types are fixed):
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
-address="${address}"
-crowd="${crowdJP}" (internal=${crowd})
-feature="${feature}"
-radius_m=${radius_m}
+Rules:
+- Use the inputs as-is. Do NOT translate "feature".
+- "crowd" is one of: "empty", "normal", "crowded" (no synonyms).
+- "assumptions" and "notes" MUST be written in "${targetLang}".
+- "confidence" is 0..1 float.
+- Respond with JSON only.
 
-JSON only.`;
+Inputs:
+address=${JSON.stringify(address)}
+crowd=${JSON.stringify(crowd)}  // internal code
+feature=${JSON.stringify(feature)}
+radius_m=${radius_m}
+`;
 }
 
 function normalizeResult(data) {
@@ -156,7 +183,7 @@ export default async function handler(req, res) {
   // CORS
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-UI-Lang");
     return res.status(204).end();
   }
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -176,13 +203,23 @@ export default async function handler(req, res) {
     const input = parsed.success ? parsed.data : looseNormalize(incoming);
     console.log("[estimate] input:", input);
 
-    // APIキー未設定でも 200 で中立推定
+    // 返答言語の決定（ja/en）
+    const targetLang = detectTargetLang(req, body, input);
+    console.log("[estimate] targetLang:", targetLang);
+
+    // APIキー未設定でも 200 で中立推定（notes/assumptionsは英語固定）
     if (!process.env.XAI_API_KEY) {
       console.warn("[estimate] missing XAI_API_KEY");
-      return res.status(200).json(neutralEstimate(input));
+      const neutral = neutralEstimate(input);
+      if (targetLang === "ja") {
+        // 簡易的に日本語化（数値は同じ）
+        neutral.assumptions = ["ヒューリスティック推定を使用。"];
+        neutral.notes = ["中立推定（API未使用）。"];
+      }
+      return res.status(200).json(neutral);
     }
 
-    const prompt = buildPrompt(input);
+    const prompt = buildPrompt(input, targetLang);
     console.log("[estimate] prompt:", prompt);
     const messages = [
       { role: "system", content: "Return JSON only." },
@@ -198,7 +235,12 @@ export default async function handler(req, res) {
       if (!data) data = tryParseJSON(String(content));
       if (!data) {
         console.warn("[estimate] parse failed, neutral estimate used");
-        return neutralEstimate(input);
+        const n = neutralEstimate(input);
+        if (targetLang === "ja") {
+          n.assumptions = ["ヒューリスティック推定を使用。"];
+          n.notes = ["中立推定（API未使用）。"];
+        }
+        return n;
       }
       const normalized = normalizeResult(data);
       console.log("[estimate] normalized result:", normalized);
@@ -222,6 +264,10 @@ export default async function handler(req, res) {
       } catch (e2) {
         console.error("[estimate] retry error:", e2);
         const neutral = neutralEstimate(input);
+        if (targetLang === "ja") {
+          neutral.assumptions = ["ヒューリスティック推定を使用。"];
+          neutral.notes = ["中立推定（API未使用）。"];
+        }
         console.log("[estimate] final neutral result:", neutral);
         return res.status(200).json(neutral);
       }
@@ -233,8 +279,13 @@ export default async function handler(req, res) {
     const c = (b?.crowd === "混雑" || b?.crowd === "crowded") ? "crowded"
           : (b?.crowd === "普通" || b?.crowd === "normal") ? "normal" : "empty";
     const neutral = neutralEstimate({ radius_m: r, crowd: c });
+    const targetLang = (b?.lang || b?.ui_lang || "").toString().toLowerCase().startsWith("ja")
+      || hasJapanese(b?.feature) || hasJapanese(b?.address) ? "ja" : "en";
+    if (targetLang === "ja") {
+      neutral.assumptions = ["ヒューリスティック推定を使用。"];
+      neutral.notes = ["中立推定（API未使用）。"];
+    }
     console.log("[estimate] emergency neutral:", neutral);
     return res.status(200).json(neutral);
   }
 }
-
