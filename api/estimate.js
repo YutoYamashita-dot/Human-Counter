@@ -1,10 +1,11 @@
 // api/estimate.js  (Vercel Node.js Serverless Function)
-import OpenAI from "openai";
 import { z } from "zod";
 
 export const config = { runtime: "nodejs" };
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// xAI API エンドポイント＆モデル
+const XAI_URL = "https://api.x.ai/v1/chat/completions";
+const XAI_MODEL = "grok-4-fast-reasoning"; // 例: grok-2-latest / grok-2-mini 等
 const TIMEOUT_MS = 30000;
 
 // --- スキーマ定義（変更なし） ---
@@ -34,7 +35,7 @@ function looseNormalize(input = {}) {
 
 function buildPrompt({ address, crowd, feature, radius_m }) {
   const crowdJP = { empty: "空いている", normal: "普通", crowded: "混雑" }[crowd];
-  return `You are an entertainment estimator.
+  return `You are an estimator.
 Output ONLY valid JSON with this structure:
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
@@ -43,7 +44,7 @@ crowd="${crowdJP}" (internal=${crowd})
 feature="${feature}"
 radius_m=${radius_m}
 
-Be humorous but consistent. JSON only.`;
+JSON only.`;
 }
 
 function normalizeResult(data) {
@@ -96,18 +97,57 @@ function neutralEstimate({ radius_m, crowd }) {
   };
 }
 
-// --- OpenAI呼び出し（モデル変更＋JSON強制）
-async function callOpenAIWithTimeout(messages, signal) {
-  console.log("[estimate] calling OpenAI...");
-  const resp = await client.chat.completions.create({
-    model: "gpt-4o-mini",                 // ★ モデルを変更（JSON対応で安定）
+// --- xAI呼び出し（JSONパラメータ差異にフォールバック対応・詳細ログ付き）
+async function callXAIWithTimeout(messages, signal) {
+  if (!process.env.XAI_API_KEY) throw new Error("Missing XAI_API_KEY");
+  const headers = {
+    "Authorization": `Bearer ${process.env.XAI_API_KEY}`,
+    "Content-Type": "application/json"
+  };
+
+  // 1回目: max_output_tokens を優先（xAI推奨）
+  const body1 = {
+    model: XAI_MODEL,
     messages,
     temperature: 1,
-    max_completion_tokens: 400,           // ★ 新仕様に合わせる
-    response_format: { type: "json_object" } // ★ JSONでの返答を強制
-  }, { signal });
-  console.log("[estimate] raw OpenAI response:", JSON.stringify(resp, null, 2)?.slice(0, 800)); // ログ抑制
-  return resp;
+    max_output_tokens: 400
+  };
+  console.log("[estimate] calling xAI (max_output_tokens)...");
+  let resp = await fetch(XAI_URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body1),
+    signal
+  });
+
+  // もし xAI 側がパラメータ非対応で 400 を返したら max_tokens に切替
+  if (!resp.ok) {
+    const txt = await resp.text();
+    console.error("[estimate] xAI first call error:", txt);
+    if (resp.status === 400 && /max_output_tokens/i.test(txt)) {
+      const body2 = {
+        model: XAI_MODEL,
+        messages,
+        temperature: 1,
+        max_tokens: 400
+      };
+      console.log("[estimate] retry xAI (max_tokens)...");
+      resp = await fetch(XAI_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body2),
+        signal
+      });
+    }
+  }
+
+  const json = await resp.json().catch(() => ({}));
+  console.log("[estimate] raw xAI response:", JSON.stringify(json)?.slice(0, 800));
+  if (!resp.ok) {
+    const msg = json?.error?.message || `xAI error: ${resp.status}`;
+    throw new Error(msg);
+  }
+  return json;
 }
 
 export default async function handler(req, res) {
@@ -134,8 +174,9 @@ export default async function handler(req, res) {
     const input = parsed.success ? parsed.data : looseNormalize(incoming);
     console.log("[estimate] input:", input);
 
-    if (!process.env.OPENAI_API_KEY) {
-      console.warn("[estimate] missing OPENAI_API_KEY");
+    // APIキー未設定でも 200 で中立推定
+    if (!process.env.XAI_API_KEY) {
+      console.warn("[estimate] missing XAI_API_KEY");
       return res.status(200).json(neutralEstimate(input));
     }
 
@@ -147,8 +188,8 @@ export default async function handler(req, res) {
     ];
 
     const execOnce = async (signal) => {
-      const resp = await callOpenAIWithTimeout(messages, signal);
-      const content = resp?.choices?.[0]?.message?.content ?? "";
+      const xres = await callXAIWithTimeout(messages, signal);
+      const content = xres?.choices?.[0]?.message?.content ?? "";
       console.log("[estimate] content:", content);
       let data = tryParseJSON(content);
       console.log("[estimate] parsed data:", data);
