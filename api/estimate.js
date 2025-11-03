@@ -20,7 +20,7 @@ const Schema = z.object({
   radius_m: z.coerce.number().int().min(10).max(40_075_000)
 });
 
-// --- 言語判定（追加） ---
+// --- 言語判定（変更なし） ---
 function hasJapanese(s = "") {
   return /[\u3040-\u30FF\u4E00-\u9FFF]/.test(String(s));
 }
@@ -52,27 +52,44 @@ function looseNormalize(input = {}) {
   return { address: addr, crowd, feature, radius_m };
 }
 
-// --- プロンプト（言語対応 & 英語入力安定化のために内部コードを使用） ---
-function buildPrompt({ address, crowd, feature, radius_m }, targetLang = "en") {
+// --- ★ 国籍フィルタの自動判定（追加） ---
+// 「feature」に国籍を示す語が含まれる場合のみ絞り込み、それ以外は "all"（国籍で絞らない）
+function detectNationalityFilter(feature = "") {
+  const s = String(feature).toLowerCase();
+  if (/(non[-\s]?japanese|foreigner|foreigners|外国人)/.test(s)) return "foreigner_only";
+  if (/(japanese( people)?|日本人)/.test(s)) return "japanese_only";
+  return "all";
+}
+
+// --- プロンプト（言語対応 & 英語入力でも“全員”を数える） ---
+function buildPrompt({ address, crowd, feature, radius_m }, targetLang = "en", nationalityFilter = "all") {
   // crowd は internal ("empty" | "normal" | "crowded") をそのまま使う
-  // assumptions / notes は targetLang で出す。JSONキーは固定・数値は実数。
+  // assumptions / notes は targetLang で。JSONキーは固定・数値は実数。
+  // ★ 重要ルールに「国籍で絞らない（all）」を明記。明示指定がある場合のみ絞り込み。
   return `You are a strict estimator. Output ONLY JSON, no prose.
 
 JSON schema (keys and types are fixed):
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
 Rules:
-- Use the inputs as-is. Do NOT translate "feature".
+- Count PEOPLE within the radius based on the "feature".
+- Nationality rule:
+  - If nationality_filter is "all", include everyone (Japanese and non-Japanese). DO NOT restrict by nationality.
+  - If "japanese_only", include Japanese people only.
+  - If "foreigner_only", include non-Japanese (foreigners) only.
+- Do NOT infer nationality from input language. English input does NOT imply "foreigner".
 - "crowd" is one of: "empty", "normal", "crowded" (no synonyms).
 - "assumptions" and "notes" MUST be written in "${targetLang}".
 - "confidence" is 0..1 float.
 - Respond with JSON only.
+- Use the inputs as-is. Do NOT translate "feature".
 
 Inputs:
 address=${JSON.stringify(address)}
 crowd=${JSON.stringify(crowd)}  // internal code
 feature=${JSON.stringify(feature)}
 radius_m=${radius_m}
+nationality_filter=${JSON.stringify(nationalityFilter)}
 `;
 }
 
@@ -134,11 +151,11 @@ async function callXAIWithTimeout(messages, signal) {
     "Content-Type": "application/json"
   };
 
-  // 1回目: max_output_tokens を優先（xAI推奨）
+  // 1回目: max_output_tokens を優先（xAI推奨） ★ 温度を下げて安定化
   const body1 = {
     model: XAI_MODEL,
     messages,
-    temperature: 1,
+    temperature: 0.3,
     max_output_tokens: 400
   };
   console.log("[estimate] calling xAI (max_output_tokens)...");
@@ -157,7 +174,7 @@ async function callXAIWithTimeout(messages, signal) {
       const body2 = {
         model: XAI_MODEL,
         messages,
-        temperature: 1,
+        temperature: 0.3,
         max_tokens: 400
       };
       console.log("[estimate] retry xAI (max_tokens)...");
@@ -207,19 +224,22 @@ export default async function handler(req, res) {
     const targetLang = detectTargetLang(req, body, input);
     console.log("[estimate] targetLang:", targetLang);
 
-    // APIキー未設定でも 200 で中立推定（notes/assumptionsは英語固定）
+    // ★ 国籍フィルタを判定（既定は all = 国籍で絞らない）
+    const nationalityFilter = detectNationalityFilter(input.feature);
+    console.log("[estimate] nationalityFilter:", nationalityFilter);
+
+    // APIキー未設定でも 200 で中立推定（notes/assumptionsは言語切替）
     if (!process.env.XAI_API_KEY) {
       console.warn("[estimate] missing XAI_API_KEY");
       const neutral = neutralEstimate(input);
       if (targetLang === "ja") {
-        // 簡易的に日本語化（数値は同じ）
         neutral.assumptions = ["ヒューリスティック推定を使用。"];
         neutral.notes = ["中立推定（API未使用）。"];
       }
       return res.status(200).json(neutral);
     }
 
-    const prompt = buildPrompt(input, targetLang);
+    const prompt = buildPrompt(input, targetLang, nationalityFilter);
     console.log("[estimate] prompt:", prompt);
     const messages = [
       { role: "system", content: "Return JSON only." },
