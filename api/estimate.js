@@ -96,16 +96,17 @@ function neutralEstimate({ radius_m, crowd }) {
   };
 }
 
-// --- OpenAI呼び出し（ログ追加）
+// --- OpenAI呼び出し（モデル変更＋JSON強制）
 async function callOpenAIWithTimeout(messages, signal) {
   console.log("[estimate] calling OpenAI...");
   const resp = await client.chat.completions.create({
-    model: "gpt-5",
+    model: "gpt-4o-mini",                 // ★ モデルを変更（JSON対応で安定）
     messages,
     temperature: 1,
-    max_completion_tokens: 400
+    max_completion_tokens: 400,           // ★ 新仕様に合わせる
+    response_format: { type: "json_object" } // ★ JSONでの返答を強制
   }, { signal });
-  console.log("[estimate] raw OpenAI response:", JSON.stringify(resp, null, 2)?.slice(0, 800)); // ログを抑制
+  console.log("[estimate] raw OpenAI response:", JSON.stringify(resp, null, 2)?.slice(0, 800)); // ログ抑制
   return resp;
 }
 
