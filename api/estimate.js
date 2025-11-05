@@ -120,6 +120,9 @@ function detectPlaceType(address = "", feature = "") {
 
 /* =========================
    プロンプト（時間・場所タイプを明示、自己検証手順を指示）
+   ※ 値が小さすぎた問題に対処：基準密度を約4倍へ再キャリブレーション、
+      妥当帯を [0.6×Expected, 1.8×Expected] にタイト化。
+   ※ 「半径スケールの厳守」と「混在用途（MIXED LAND-USE）」を明示。
 ========================= */
 function buildPrompt(input, targetLang = "en", nationalityFilter = "all") {
   const { address, crowd, feature, radius_m, local_time_iso } = input;
@@ -157,17 +160,46 @@ Context (use as priors, not ground-truth):
 - radius_m: ${radius_m}
 - nationality_filter: ${JSON.stringify(nationalityFilter)}
 
+CALIBRATED BASELINES (people/km^2):
+  station~12000, airport~8800, mall~6000, office~4800, school~3200, tourist~4000, residential~1600, park~800, generic~2400.
+
+TIME FACTORS:
+  morning_commute ×1.6, lunch ×1.3, evening_commute ×1.7, daytime ×1.0, early_morning ×0.5, night ×0.3, other ×0.8.
+
+CROWD FACTORS:
+  empty ×0.4, normal ×1.0, crowded ×2.
+
+MIXED LAND-USE ADJUSTMENT (the circle includes multiple building types):
+- Derive a land-use mix vector W over {station, airport, mall, office, school, tourist, residential, park, generic} with ΣW=1.0.
+- Heuristics:
+  • Assign 0.6 to the detected place_type as primary.
+  • Allocate the remaining 0.4 based on hints in address/feature and time_slot:
+      - If hints include residential housing terms, add +0.2 to residential.
+      - If business/office terms, add +0.2 to office.
+      - If park/green words, add +0.2 to park.
+      - Otherwise distribute +0.2 to residential and +0.2 to generic.
+      - At morning/evening commute, shift +0.1 from park to station/office (split evenly if both apply).
+      - At night, shift +0.15 from office to residential.
+  • Clamp weights to [0,1] and renormalize so ΣW=1.0.
+- Compute mixed_baseline = Σ_i (W_i × baseline_i).
+
+RADIUS SCALING REQUIREMENT:
+- Compute area_km2 = π × (radius_m/1000)^2 and use it multiplicatively.
+- Do NOT cap or dampen by a fixed constant: larger radius_m must monotonically increase expected value (all else equal).
+
 SELF-VALIDATION PROCESS (perform before finalizing JSON):
-1) Compute area_km2 = π * (radius_m/1000)^2.
-2) Choose a baseline density (people/km^2) by place_type (approximate):
-   station~3000, airport~2200, mall~1500, office~1200, school~800, tourist~1000, residential~400, park~200, generic~600.
-3) Apply time_slot factor:
-   morning_commute ×1.6, lunch ×1.3, evening_commute ×1.7, daytime ×1.0, early_morning ×0.5, night ×0.3, other ×0.8.
-4) Apply crowd factor: empty ×0.5, normal ×1.0, crowded ×1.8.
-5) Expected = area_km2 × baseline × time × crowd.
-6) Plausibility band = [Expected × 0.35, Expected × 2.5] (rounded to ints, >=0).
+1) area_km2 = π × (radius_m/1000)^2.
+2) mixed_baseline from MIXED LAND-USE ADJUSTMENT.
+3) time_factor from TIME FACTORS.
+4) crowd_factor from CROWD FACTORS.
+5) Expected = area_km2 × mixed_baseline × time_factor × crowd_factor.
+6) Plausibility band = [Expected × 0.6, Expected × 1.8] (rounded to ints, >=0).
 7) If your "count" is outside this band, adjust it back into the band and add a note explaining the adjustment.
 8) Set "range.min/max" around your "count" (~ -30% / +40%), but keep them within [0, count×2.5] and min<=max.
+9) Append calculation lines to notes with prefix "calc:" in this exact format:
+   calc: radius_m=${radius_m}, area_km2=<number>, mixed_baseline=<number>, time_factor=<number>, crowd_factor=<number>, expected=<number>, band=[<min>..<max>].
+10) Also append a second "calc:" line showing your final W vector as JSON (keys present only for non-zero weights), e.g.:
+   calc: W={"station":0.6,"residential":0.25,"generic":0.15}.
 
 Return the final JSON after applying the SELF-VALIDATION PROCESS.`;
 }
@@ -213,13 +245,13 @@ function tryParseJSON(content = "") {
 }
 
 /* =========================
-   中立推定（既存）
+   中立推定（既存）※基準密度を4倍（400→1600）に補正
 ========================= */
 function neutralEstimate({ radius_m, crowd }) {
   const r_km = Math.max(0, radius_m) / 1000;
   const area = Math.PI * r_km * r_km;
   const crowdFactor = crowd === "crowded" ? 1.8 : crowd === "normal" ? 1.0 : 0.5;
-  const baseDensity = 400;
+  const baseDensity = 1600; // ★ 再キャリブレーション（従来400）
   const est = Math.max(0, Math.round(area * baseDensity * crowdFactor));
   const spread = Math.round(est * 0.35 + 15);
   return {
@@ -235,6 +267,7 @@ function neutralEstimate({ radius_m, crowd }) {
    サーバー側「自己検証プロセス」
    - 返答を再チェックし、妥当帯から外れていれば補正
    - 結果を notes に追記（ja/enに対応）
+   - 計算式（calc: ...）も必ず notes に追加
 ========================= */
 function serverSideSelfValidate(out, input, targetLang) {
   const t = parseLocalTimeInfo(input.local_time_iso);
@@ -242,9 +275,10 @@ function serverSideSelfValidate(out, input, targetLang) {
   const r_km = Math.max(0, input.radius_m) / 1000;
   const area = Math.PI * r_km * r_km;
 
+  // ★ 再キャリブレーション済み基準密度（約4倍）
   const baselineByPlace = {
-    station: 3000, airport: 2200, mall: 1500, office: 1200,
-    school: 800, tourist: 1000, residential: 400, park: 200, generic: 600
+    station: 12000, airport: 8800, mall: 6000, office: 4800,
+    school: 3200, tourist: 4000, residential: 1600, park: 800, generic: 2400
   };
   const timeFactor = {
     morning_commute: 1.6, lunch: 1.3, evening_commute: 1.7,
@@ -252,12 +286,13 @@ function serverSideSelfValidate(out, input, targetLang) {
   };
   const crowdFactor = input.crowd === "crowded" ? 1.8 : input.crowd === "normal" ? 1.0 : 0.5;
 
-  const base = baselineByPlace[place] ?? 600;
+  const base = baselineByPlace[place] ?? 2400;
   const tf = timeFactor[t.slot] ?? 0.8;
   const expected = area * base * tf * crowdFactor;
 
-  const bandMin = Math.max(0, Math.round(expected * 0.35));
-  const bandMax = Math.max(bandMin, Math.round(expected * 2.5));
+  // ★ 妥当帯をタイト化（0.6x〜1.8x）
+  const bandMin = Math.max(0, Math.round(expected * 0.6));
+  const bandMax = Math.max(bandMin, Math.round(expected * 1.8));
 
   let adjusted = { ...out };
   let changed = false;
@@ -275,17 +310,21 @@ function serverSideSelfValidate(out, input, targetLang) {
   const maxRange = Math.max(minRange, Math.round(adjusted.count * 1.4));
   adjusted.range = { min: minRange, max: maxRange };
 
-  // 注記追記（多言語）
+  // 注記追記（多言語）＋ 計算式（calc）行の明示
   const notes = adjusted.notes ?? [];
+  const calcLine = `calc: area_km2=${Number(area.toFixed(6))}, baseline=${base}, time_factor=${tf}, crowd_factor=${crowdFactor}, expected=${Math.round(expected)}, band=[${bandMin}..${bandMax}]`;
+
   if (targetLang === "ja") {
     notes.push(
       `自己検証: 期待値=${Math.round(expected)}, 妥当帯=[${bandMin}〜${bandMax}]`,
-      changed ? "自己検証により推定値を妥当帯へ調整しました。" : "自己検証により推定値は妥当と判断されました。"
+      changed ? "自己検証により推定値を妥当帯へ調整しました。" : "自己検証により推定値は妥当と判断されました。",
+      calcLine
     );
   } else {
     notes.push(
       `Self-check: expected=${Math.round(expected)}, plausible=[${bandMin}..${bandMax}]`,
-      changed ? "Adjusted into plausible band based on self-validation." : "Estimate passed self-validation."
+      changed ? "Adjusted into plausible band based on self-validation." : "Estimate passed self-validation.",
+      calcLine
     );
   }
   adjusted.notes = notes.slice(0, 10); // ノートは最大10件程度に制限
@@ -305,7 +344,7 @@ async function callXAIWithTimeout(messages, signal) {
   const body1 = {
     model: XAI_MODEL,
     messages,
-    temperature: 0,
+    temperature: 0.1,
     max_output_tokens: 400
   };
   console.log("[estimate] calling xAI (max_output_tokens)...");
@@ -320,7 +359,7 @@ async function callXAIWithTimeout(messages, signal) {
     const txt = await resp.text();
     console.error("[estimate] xAI first call error:", txt);
     if (resp.status === 400 && /max_output_tokens/i.test(txt)) {
-      const body2 = { model: XAI_MODEL, messages, temperature: 0, max_tokens: 400 };
+      const body2 = { model: XAI_MODEL, messages, temperature: 0.1, max_tokens: 400 };
       console.log("[estimate] retry xAI (max_tokens)...");
       resp = await fetch(XAI_URL, {
         method: "POST",
@@ -452,7 +491,7 @@ export default async function handler(req, res) {
     }
   } catch (err) {
     console.error("[estimate] handler fatal:", err);
-    // フェイルセーフ
+       // フェイルセーフ
     const b = req?.body || {};
     const r = Number(b?.radius_m ?? b?.radius ?? 500) || 500;
     const c = (b?.crowd === "混雑" || b?.crowd === "crowded") ? "crowded"
