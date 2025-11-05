@@ -8,7 +8,11 @@ const XAI_URL = "https://api.x.ai/v1/chat/completions";
 const XAI_MODEL = "grok-4-fast-reasoning"; // 例: grok-2-latest / grok-2-mini 等
 const TIMEOUT_MS = 30000;
 
-// --- スキーマ定義（変更なし） ---
+/* =========================
+   スキーマ定義（拡張）
+   - 互換性維持: 既存キーは変更なし
+   - 追加: local_time_iso（現地ISO日時）/ radius は従来どおり radius_m に吸収
+========================= */
 const CrowdJp = z.enum(["空いている", "普通", "混雑"]);
 const CrowdInternal = z.enum(["empty", "normal", "crowded"]);
 
@@ -17,10 +21,14 @@ const Schema = z.object({
   crowd: z.union([CrowdJp, CrowdInternal])
     .transform(v => (v === "空いている" ? "empty" : v === "普通" ? "normal" : v === "混雑" ? "crowded" : v)),
   feature: z.string().transform(s => (s ?? "").toString().trim()).pipe(z.string().min(1).max(140)),
-  radius_m: z.coerce.number().int().min(10).max(40_075_000)
+  radius_m: z.coerce.number().int().min(10).max(40_075_000),
+  // ★ 追加（任意）：UIから渡す現地時刻（ISO文字列: "YYYY-MM-DDTHH:mm:ss"）
+  local_time_iso: z.string().optional().nullable()
 });
 
-// --- 言語判定（変更なし） ---
+/* =========================
+   言語判定（変更なし）
+========================= */
 function hasJapanese(s = "") {
   return /[\u3040-\u30FF\u4E00-\u9FFF]/.test(String(s));
 }
@@ -39,6 +47,9 @@ function detectTargetLang(req, body, input) {
   return "en";
 }
 
+/* =========================
+   緩い正規化（スキーマ失敗時のフォールバック）
+========================= */
 function looseNormalize(input = {}) {
   const addr = String(input?.address ?? "").trim() || "unknown";
   const c = input?.crowd;
@@ -49,11 +60,13 @@ function looseNormalize(input = {}) {
   const feature = String(input?.feature ?? "").trim() || "people";
   const r = Number(input?.radius_m ?? input?.radius ?? 500);
   const radius_m = Number.isFinite(r) ? Math.round(Math.max(10, Math.min(r, 40_075_000))) : 500;
-  return { address: addr, crowd, feature, radius_m };
+  const local_time_iso = (input?.local_time_iso && String(input.local_time_iso)) || null;
+  return { address: addr, crowd, feature, radius_m, local_time_iso };
 }
 
-// --- ★ 国籍フィルタの自動判定（追加） ---
-// 「feature」に国籍を示す語が含まれる場合のみ絞り込み、それ以外は "all"（国籍で絞らない）
+/* =========================
+   国籍フィルタ（既存）
+========================= */
 function detectNationalityFilter(feature = "") {
   const s = String(feature).toLowerCase();
   if (/(non[-\s]?japanese|foreigner|foreigners|外国人)/.test(s)) return "foreigner_only";
@@ -61,38 +74,107 @@ function detectNationalityFilter(feature = "") {
   return "all";
 }
 
-// --- プロンプト（言語対応 & 英語入力でも“全員”を数える） ---
-function buildPrompt({ address, crowd, feature, radius_m }, targetLang = "en", nationalityFilter = "all") {
-  // crowd は internal ("empty" | "normal" | "crowded") をそのまま使う
-  // assumptions / notes は targetLang で。JSONキーは固定・数値は実数。
-  // ★ 重要ルールに「国籍で絞らない（all）」を明記。明示指定がある場合のみ絞り込み。
+/* =========================
+   現地時間の解釈（時間帯/曜日）
+========================= */
+function parseLocalTimeInfo(local_time_iso) {
+  try {
+    if (!local_time_iso) return { iso: null, hour: null, weekday: null, weekend: null, slot: "unknown" };
+    const d = new Date(local_time_iso);
+    if (isNaN(d.getTime())) return { iso: null, hour: null, weekday: null, weekend: null, slot: "unknown" };
+    const hour = d.getHours();                // 0..23
+    const weekday = d.getDay();               // 0=Sun..6=Sat
+    const weekend = (weekday === 0 || weekday === 6);
+
+    // 時間帯スロット
+    let slot = "daytime";
+    if (hour >= 7 && hour <= 9) slot = "morning_commute";
+    else if (hour >= 11 && hour <= 13) slot = "lunch";
+    else if (hour >= 17 && hour <= 20) slot = "evening_commute";
+    else if (hour >= 22 || hour <= 4) slot = "night";
+    else if (hour >= 5 && hour <= 6) slot = "early_morning";
+    else if (hour >= 10 && hour <= 16) slot = "daytime";
+    else slot = "other";
+
+    return { iso: d.toISOString(), hour, weekday, weekend, slot };
+  } catch {
+    return { iso: null, hour: null, weekday: null, weekend: null, slot: "unknown" };
+  }
+}
+
+/* =========================
+   場所タイプ推定（address/feature からヒューリスティック）
+========================= */
+function detectPlaceType(address = "", feature = "") {
+  const s = `${address} ${feature}`.toLowerCase();
+  if (/(station|駅|train|metro|subway|terminal)/.test(s)) return "station";
+  if (/(airport|空港)/.test(s)) return "airport";
+  if (/(mall|shopping|ショッピング|百貨店|デパート|商業|plaza|outlet)/.test(s)) return "mall";
+  if (/(park|公園|広場|square)/.test(s)) return "park";
+  if (/(residential|住宅|団地|apartment|マンション|戸建)/.test(s)) return "residential";
+  if (/(office|オフィス|ビジネス街|business district)/.test(s)) return "office";
+  if (/(school|大学|campus|学校|高校|小学校|中学校)/.test(s)) return "school";
+  if (/(temple|shrine|神社|寺|観光|tourist|観光地|観光客)/.test(s)) return "tourist";
+  return "generic";
+}
+
+/* =========================
+   プロンプト（時間・場所タイプを明示、自己検証手順を指示）
+========================= */
+function buildPrompt(input, targetLang = "en", nationalityFilter = "all") {
+  const { address, crowd, feature, radius_m, local_time_iso } = input;
+  const time = parseLocalTimeInfo(local_time_iso);
+  const placeType = detectPlaceType(address, feature);
+
+  // 「自己検証プロセス」をモデルに明示：JSONのみ返す制約は維持
   return `You are an estimator. Output ONLY JSON, no prose.
 
 JSON schema (keys and types are fixed):
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
-Rules:
-- Count PEOPLE within the radius based on the "feature".
+Hard rules:
+- Count PEOPLE within the circle based on "feature".
 - Nationality rule:
   - If nationality_filter is "all", include everyone (Japanese and non-Japanese). DO NOT restrict by nationality.
   - If "japanese_only", include Japanese people only.
   - If "foreigner_only", include non-Japanese (foreigners) only.
 - Do NOT infer nationality from input language. English input does NOT imply "foreigner".
-- "crowd" is one of: "empty", "normal", "crowded" (no synonyms).
+- "crowd" is one of: "empty" | "normal" | "crowded".
 - "assumptions" and "notes" MUST be written in "${targetLang}".
 - "confidence" is 0..1 float.
-- Respond with JSON only.
-- Use the inputs as-is. Do NOT translate "feature".
+- Respond with JSON only. No extra text.
 
-Inputs:
-address=${JSON.stringify(address)}
-crowd=${JSON.stringify(crowd)}  // internal code
-feature=${JSON.stringify(feature)}
-radius_m=${radius_m}
-nationality_filter=${JSON.stringify(nationalityFilter)}
-`;
+Context (use as priors, not ground-truth):
+- address: ${JSON.stringify(address)}
+- local_time_iso: ${JSON.stringify(time.iso || local_time_iso || null)}
+- local_hour: ${JSON.stringify(time.hour)}
+- weekday_index: ${JSON.stringify(time.weekday)}   // 0=Sun..6=Sat
+- weekend: ${JSON.stringify(time.weekend)}
+- time_slot: ${JSON.stringify(time.slot)}          // morning_commute, lunch, evening_commute, night, etc.
+- place_type: ${JSON.stringify(placeType)}         // station/airport/mall/park/residential/office/school/tourist/generic
+- crowd: ${JSON.stringify(crowd)}
+- feature: ${JSON.stringify(feature)}
+- radius_m: ${radius_m}
+- nationality_filter: ${JSON.stringify(nationalityFilter)}
+
+SELF-VALIDATION PROCESS (perform before finalizing JSON):
+1) Compute area_km2 = π * (radius_m/1000)^2.
+2) Choose a baseline density (people/km^2) by place_type (approximate):
+   station~3000, airport~2200, mall~1500, office~1200, school~800, tourist~1000, residential~400, park~200, generic~600.
+3) Apply time_slot factor:
+   morning_commute ×1.6, lunch ×1.3, evening_commute ×1.7, daytime ×1.0, early_morning ×0.5, night ×0.3, other ×0.8.
+4) Apply crowd factor: empty ×0.5, normal ×1.0, crowded ×1.8.
+5) Expected = area_km2 × baseline × time × crowd.
+6) Plausibility band = [Expected × 0.35, Expected × 2.5] (rounded to ints, >=0).
+7) If your "count" is outside this band, adjust it back into the band and add a note explaining the adjustment.
+8) Set "range.min/max" around your "count" (~ -30% / +40%), but keep them within [0, count×2.5] and min<=max.
+
+Return the final JSON after applying the SELF-VALIDATION PROCESS.`;
 }
 
+/* =========================
+   xAI返却の正規化（既存）
+========================= */
 function normalizeResult(data) {
   const num = (v, d=0) => (Number.isFinite(Number(v)) ? Number(v) : d);
   const clamp = (v,min,max)=>Math.max(min,Math.min(max,v));
@@ -111,6 +193,9 @@ function normalizeResult(data) {
   };
 }
 
+/* =========================
+   JSON抽出（既存）
+========================= */
 function tryParseJSON(content = "") {
   if (typeof content !== "string") return null;
   const fenced = content.match(/```json([\s\S]*?)```/i);
@@ -127,6 +212,9 @@ function tryParseJSON(content = "") {
   return null;
 }
 
+/* =========================
+   中立推定（既存）
+========================= */
 function neutralEstimate({ radius_m, crowd }) {
   const r_km = Math.max(0, radius_m) / 1000;
   const area = Math.PI * r_km * r_km;
@@ -143,7 +231,70 @@ function neutralEstimate({ radius_m, crowd }) {
   };
 }
 
-// --- xAI呼び出し（JSONパラメータ差異にフォールバック対応・詳細ログ付き）
+/* =========================
+   サーバー側「自己検証プロセス」
+   - 返答を再チェックし、妥当帯から外れていれば補正
+   - 結果を notes に追記（ja/enに対応）
+========================= */
+function serverSideSelfValidate(out, input, targetLang) {
+  const t = parseLocalTimeInfo(input.local_time_iso);
+  const place = detectPlaceType(input.address, input.feature);
+  const r_km = Math.max(0, input.radius_m) / 1000;
+  const area = Math.PI * r_km * r_km;
+
+  const baselineByPlace = {
+    station: 3000, airport: 2200, mall: 1500, office: 1200,
+    school: 800, tourist: 1000, residential: 400, park: 200, generic: 600
+  };
+  const timeFactor = {
+    morning_commute: 1.6, lunch: 1.3, evening_commute: 1.7,
+    daytime: 1.0, early_morning: 0.5, night: 0.3, other: 0.8, unknown: 0.8
+  };
+  const crowdFactor = input.crowd === "crowded" ? 1.8 : input.crowd === "normal" ? 1.0 : 0.5;
+
+  const base = baselineByPlace[place] ?? 600;
+  const tf = timeFactor[t.slot] ?? 0.8;
+  const expected = area * base * tf * crowdFactor;
+
+  const bandMin = Math.max(0, Math.round(expected * 0.35));
+  const bandMax = Math.max(bandMin, Math.round(expected * 2.5));
+
+  let adjusted = { ...out };
+  let changed = false;
+
+  if (adjusted.count < bandMin) {
+    adjusted.count = bandMin;
+    changed = true;
+  } else if (adjusted.count > bandMax) {
+    adjusted.count = bandMax;
+    changed = true;
+  }
+
+  // range再調整（安全側）
+  const minRange = Math.max(0, Math.round(adjusted.count * 0.7));
+  const maxRange = Math.max(minRange, Math.round(adjusted.count * 1.4));
+  adjusted.range = { min: minRange, max: maxRange };
+
+  // 注記追記（多言語）
+  const notes = adjusted.notes ?? [];
+  if (targetLang === "ja") {
+    notes.push(
+      `自己検証: 期待値=${Math.round(expected)}, 妥当帯=[${bandMin}〜${bandMax}]`,
+      changed ? "自己検証により推定値を妥当帯へ調整しました。" : "自己検証により推定値は妥当と判断されました。"
+    );
+  } else {
+    notes.push(
+      `Self-check: expected=${Math.round(expected)}, plausible=[${bandMin}..${bandMax}]`,
+      changed ? "Adjusted into plausible band based on self-validation." : "Estimate passed self-validation."
+    );
+  }
+  adjusted.notes = notes.slice(0, 10); // ノートは最大10件程度に制限
+  return adjusted;
+}
+
+/* =========================
+   xAI呼び出し（既存・詳細ログ）
+========================= */
 async function callXAIWithTimeout(messages, signal) {
   if (!process.env.XAI_API_KEY) throw new Error("Missing XAI_API_KEY");
   const headers = {
@@ -151,11 +302,10 @@ async function callXAIWithTimeout(messages, signal) {
     "Content-Type": "application/json"
   };
 
-  // 1回目: max_output_tokens を優先（xAI推奨） ★ 温度を下げて安定化
   const body1 = {
     model: XAI_MODEL,
     messages,
-    temperature: 0.3,
+    temperature: 0,
     max_output_tokens: 400
   };
   console.log("[estimate] calling xAI (max_output_tokens)...");
@@ -166,17 +316,11 @@ async function callXAIWithTimeout(messages, signal) {
     signal
   });
 
-  // もし xAI 側がパラメータ非対応で 400 を返したら max_tokens に切替
   if (!resp.ok) {
     const txt = await resp.text();
     console.error("[estimate] xAI first call error:", txt);
     if (resp.status === 400 && /max_output_tokens/i.test(txt)) {
-      const body2 = {
-        model: XAI_MODEL,
-        messages,
-        temperature: 0.3,
-        max_tokens: 400
-      };
+      const body2 = { model: XAI_MODEL, messages, temperature: 0, max_tokens: 400 };
       console.log("[estimate] retry xAI (max_tokens)...");
       resp = await fetch(XAI_URL, {
         method: "POST",
@@ -196,6 +340,9 @@ async function callXAIWithTimeout(messages, signal) {
   return json;
 }
 
+/* =========================
+   ハンドラ
+========================= */
 export default async function handler(req, res) {
   // CORS
   if (req.method === "OPTIONS") {
@@ -214,7 +361,11 @@ export default async function handler(req, res) {
       try { body = JSON.parse(body); } catch { body = {}; }
     }
     if (!body || typeof body !== "object") body = {};
-    const incoming = { ...body, radius_m: body?.radius_m ?? body?.radius };
+    const incoming = {
+      ...body,
+      radius_m: body?.radius_m ?? body?.radius,
+      local_time_iso: body?.local_time_iso ?? body?.time ?? body?.localTime
+    };
 
     let parsed = Schema.safeParse(incoming);
     const input = parsed.success ? parsed.data : looseNormalize(incoming);
@@ -224,21 +375,23 @@ export default async function handler(req, res) {
     const targetLang = detectTargetLang(req, body, input);
     console.log("[estimate] targetLang:", targetLang);
 
-    // ★ 国籍フィルタを判定（既定は all = 国籍で絞らない）
+    // 国籍フィルタ
     const nationalityFilter = detectNationalityFilter(input.feature);
     console.log("[estimate] nationalityFilter:", nationalityFilter);
 
-    // APIキー未設定でも 200 で中立推定（notes/assumptionsは言語切替）
+    // APIキー未設定 → 中立推定 + サーバー側自己検証
     if (!process.env.XAI_API_KEY) {
       console.warn("[estimate] missing XAI_API_KEY");
-      const neutral = neutralEstimate(input);
+      let neutral = neutralEstimate(input);
       if (targetLang === "ja") {
         neutral.assumptions = ["ヒューリスティック推定を使用。"];
         neutral.notes = ["中立推定（API未使用）。"];
       }
+      neutral = serverSideSelfValidate(neutral, input, targetLang);
       return res.status(200).json(neutral);
     }
 
+    // プロンプト
     const prompt = buildPrompt(input, targetLang, nationalityFilter);
     console.log("[estimate] prompt:", prompt);
     const messages = [
@@ -253,18 +406,22 @@ export default async function handler(req, res) {
       let data = tryParseJSON(content);
       console.log("[estimate] parsed data:", data);
       if (!data) data = tryParseJSON(String(content));
+      let normalized;
       if (!data) {
         console.warn("[estimate] parse failed, neutral estimate used");
-        const n = neutralEstimate(input);
+        normalized = neutralEstimate(input);
         if (targetLang === "ja") {
-          n.assumptions = ["ヒューリスティック推定を使用。"];
-          n.notes = ["中立推定（API未使用）。"];
+          normalized.assumptions = ["ヒューリスティック推定を使用。"];
+          normalized.notes = ["中立推定（API未使用）。"];
         }
-        return n;
+      } else {
+        normalized = normalizeResult(data);
       }
-      const normalized = normalizeResult(data);
-      console.log("[estimate] normalized result:", normalized);
-      return normalized;
+
+      // ★ サーバー側「自己検証プロセス」適用（最終の妥当性チェック＆必要なら補正）
+      const validated = serverSideSelfValidate(normalized, input, targetLang);
+      console.log("[estimate] validated result:", validated);
+      return validated;
     };
 
     const controller = new AbortController();
@@ -283,28 +440,36 @@ export default async function handler(req, res) {
         return res.status(200).json(out2);
       } catch (e2) {
         console.error("[estimate] retry error:", e2);
-        const neutral = neutralEstimate(input);
+        let neutral = neutralEstimate(input);
         if (targetLang === "ja") {
           neutral.assumptions = ["ヒューリスティック推定を使用。"];
           neutral.notes = ["中立推定（API未使用）。"];
         }
+        neutral = serverSideSelfValidate(neutral, input, targetLang);
         console.log("[estimate] final neutral result:", neutral);
         return res.status(200).json(neutral);
       }
     }
   } catch (err) {
     console.error("[estimate] handler fatal:", err);
+    // フェイルセーフ
     const b = req?.body || {};
     const r = Number(b?.radius_m ?? b?.radius ?? 500) || 500;
     const c = (b?.crowd === "混雑" || b?.crowd === "crowded") ? "crowded"
           : (b?.crowd === "普通" || b?.crowd === "normal") ? "normal" : "empty";
-    const neutral = neutralEstimate({ radius_m: r, crowd: c });
+    let neutral = neutralEstimate({ radius_m: r, crowd: c });
     const targetLang = (b?.lang || b?.ui_lang || "").toString().toLowerCase().startsWith("ja")
       || hasJapanese(b?.feature) || hasJapanese(b?.address) ? "ja" : "en";
     if (targetLang === "ja") {
       neutral.assumptions = ["ヒューリスティック推定を使用。"];
       neutral.notes = ["中立推定（API未使用）。"];
     }
+    // 可能なら追加情報で自己検証
+    const inputLite = looseNormalize({
+      address: b?.address, crowd: c, feature: b?.feature,
+      radius_m: r, local_time_iso: b?.local_time_iso ?? b?.time ?? b?.localTime
+    });
+    neutral = serverSideSelfValidate(neutral, inputLite, targetLang);
     console.log("[estimate] emergency neutral:", neutral);
     return res.status(200).json(neutral);
   }
