@@ -344,7 +344,7 @@ async function callXAIWithTimeout(messages, signal) {
   const body1 = {
     model: XAI_MODEL,
     messages,
-    temperature: 0.1,
+    temperature: 0.4,
     max_output_tokens: 400
   };
   console.log("[estimate] calling xAI (max_output_tokens)...");
@@ -359,7 +359,7 @@ async function callXAIWithTimeout(messages, signal) {
     const txt = await resp.text();
     console.error("[estimate] xAI first call error:", txt);
     if (resp.status === 400 && /max_output_tokens/i.test(txt)) {
-      const body2 = { model: XAI_MODEL, messages, temperature: 0.1, max_tokens: 400 };
+      const body2 = { model: XAI_MODEL, messages, temperature: 0.4, max_tokens: 400 };
       console.log("[estimate] retry xAI (max_tokens)...");
       resp = await fetch(XAI_URL, {
         method: "POST",
