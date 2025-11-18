@@ -224,7 +224,7 @@ function baselineEstimate(input, nationalityFilter = "all") {
 }
 
 /* =========================
-   プロンプト（できるだけ短い日本語プロンプト）
+   プロンプト（できるだけ短い日本語プロンプト＋自己検証プロセス）
 ========================= */
 function buildPrompt(input, targetLang, nationalityFilter, baseline) {
   const { address, crowd, feature, radius_m, local_time_iso } = input;
@@ -238,6 +238,8 @@ function buildPrompt(input, targetLang, nationalityFilter, baseline) {
   } else if (radius_km >= 800) {
     scaleHint = "country_or_large_region";
   }
+
+  const area_km2 = baseline.area_km2;
 
   return `あなたは人数を推定するAIです。以下の条件に当てはまる「人の人数」を、現実世界であり得るオーダーで推定してください。
 
@@ -256,6 +258,14 @@ function buildPrompt(input, targetLang, nationalityFilter, baseline) {
 - count は現実世界の人口を超えない範囲で、極端に小さすぎる値・大きすぎる値は避けてください。
 - confidence は 0〜1 の間の値にしてください。
 - assumptions と notes には、推定の理由や前提を簡潔に日本語で書いてください。
+
+自己検証プロセス（数値チェック）:
+- 半径 radius_m から計算される円の面積 area_km2（今回の概算: 約 ${area_km2.toFixed(
+    3
+  )} km^2）を用いて、人数密度 density = count / area_km2 を考え、駅前・住宅地・公園などとして極端に高すぎないか／低すぎないか確認してください。
+- 半径が非常に大きい場合（scale_hint が country_or_large_region や earth の場合）、対象地域の総人口を大きく超えていないか確認してください。
+- range.min ≤ count ≤ range.max になるよう、一貫した範囲になっているか確認してください。
+- 上記チェックで不自然だと感じた場合は、count や range を修正し、その理由を notes に1行以上必ず書いてください。
 
 入力情報:
 - address: ${JSON.stringify(address)}
@@ -598,3 +608,4 @@ export default async function handler(req, res) {
     return res.status(200).json(adjusted);
   }
 }
+
