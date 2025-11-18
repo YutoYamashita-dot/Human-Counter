@@ -224,10 +224,31 @@ function baselineEstimate(input, nationalityFilter = "all") {
 }
 
 /* =========================
-   プロンプト（シンプル版）
+   プロンプト（シンプル版・大半径対応＆現実的スケール強調）
 ========================= */
 function buildPrompt(input, targetLang, nationalityFilter, baseline) {
   const { address, crowd, feature, radius_m, local_time_iso } = input;
+
+  const radius_km = radius_m / 1000;
+  const addressLower = String(address || "").toLowerCase();
+
+  // スケール判定: ローカル / 日本全体 / 地球全体 など
+  let scaleHint = "local"; // "local" | "large_region" | "japan_country" | "global_earth"
+  if (radius_km >= 5000) {
+    // ほぼ地球全体
+    scaleHint = "global_earth";
+  } else if (radius_km >= 800 && radius_km <= 3000) {
+    // 1000km 前後 → 日本全体レベルを想定
+    if (/日本|japan/.test(addressLower) || targetLang === "ja") {
+      scaleHint = "japan_country";
+    } else {
+      scaleHint = "large_region";
+    }
+  }
+
+  // 人口の現実的な上限（おおよそ、2020年代中盤）
+  const japanTotalPopulationApprox = 1.23e8; // 約 1.23 億人
+  const worldTotalPopulationApprox = 8.2e9;  // 約 82 億人
 
   return `You are an estimator. Output ONLY JSON, no prose.
 
@@ -245,27 +266,67 @@ Rules:
 - "confidence" is a float 0..1.
 - Respond with JSON only. No extra text.
 
+Scale handling:
+- scale_hint = "local": treat this as a local area (city block, neighborhood, station area, etc.).
+- scale_hint = "large_region": treat this as a several-hundred-kilometer region (multiple cities or a large region).
+- scale_hint = "japan_country":
+  - Treat the circle as roughly covering the whole of Japan.
+  - Use a realistic total population for Japan in the mid-2020s: about ${Math.round(
+    japanTotalPopulationApprox
+  )} people.
+  - Your "count" MUST NEVER exceed this total population.
+  - When the feature is a subset (e.g. people eating, people wearing red clothes), your "count" should usually be a reasonable fraction of the total population (often a few percent or less), unless there is a very strong reason.
+- scale_hint = "global_earth":
+  - Treat the circle as covering almost the entire Earth.
+  - Use a realistic total world population in the mid-2020s: about ${Math.round(
+    worldTotalPopulationApprox
+  )} people.
+  - Your "count" MUST NEVER exceed this world population.
+  - For specific features, estimate a reasonable subset of the world population.
+
+Important realism guidance:
+- Use the baseline numbers below as a realistic ORDER OF MAGNITUDE.
+- Do NOT arbitrarily shrink the count far below the baseline without a clear, concrete reason.
+- If you are unsure, avoid obviously underestimating: it is better to stay around the baseline_expected_people or slightly above it than to output unrealistically small numbers.
+- Ensure that "range.min" and "range.max" remain consistent with realistic human populations for the given scale (local, country, global).
+
 Context:
 - address: ${JSON.stringify(address)}
 - local_time_iso: ${JSON.stringify(local_time_iso || baseline.timeIso || null)}
-- time_slot: ${JSON.stringify(baseline.timeSlot)}  // morning_commute, lunch, evening_commute, night, etc.
-- place_type: ${JSON.stringify(baseline.placeType)} // station/airport/mall/park/residential/office/school/tourist/generic
+- time_slot: ${JSON.stringify(
+    baseline.timeSlot
+  )}  // morning_commute, lunch, evening_commute, night, etc.
+- place_type: ${JSON.stringify(
+    baseline.placeType
+  )} // station/airport/mall/park/residential/office/school/tourist/generic
 - crowd: ${JSON.stringify(crowd)}
 - feature: ${JSON.stringify(feature)}
 - radius_m: ${radius_m}
+- radius_km: ${radius_km.toFixed(3)}
+- scale_hint: ${JSON.stringify(
+    scaleHint
+  )} // "local" | "large_region" | "japan_country" | "global_earth"
 - nationality_filter: ${JSON.stringify(nationalityFilter)}
+- japan_total_population_approx: ${japanTotalPopulationApprox}
+- world_total_population_approx: ${worldTotalPopulationApprox}
 
 Simple heuristic baseline (for your reference):
 - area_km2 ≈ ${baseline.area_km2.toFixed(4)}
 - base_density_people_per_km2 ≈ ${baseline.baseDensity}
 - time_factor ≈ ${baseline.timeFactor}
 - crowd_factor ≈ ${baseline.crowdFactor}
-- baseline_expected_people ≈ ${Math.round(baseline.expected)} (plausible band ${baseline.bandMin}〜${baseline.bandMax})
+- baseline_expected_people ≈ ${Math.round(
+    baseline.expected
+  )} (plausible band ${baseline.bandMin}〜${baseline.bandMax})
 
 Self-check guideline:
-- Your "count" should normally stay within 0.3x〜3x of baseline_expected_people.
-- If you go far outside that range, clearly explain why in "notes".
-- Set "range.min/max" so that most realistic values are covered (for example -30% / +40% around your count).`;
+- For local or regional scales ("local", "large_region"):
+  - Your "count" should normally stay within about 0.8x〜2.5x of baseline_expected_people.
+  - If you go outside that range, clearly explain the specific reasons in "notes".
+- For "japan_country" and "global_earth":
+  - First check that "count" is well below the total population when you are estimating a subset (specific activity, clothing, etc.).
+  - Then check that the order of magnitude is reasonable (for example, it would be unrealistic if only a tiny number of people matched a very common condition).
+- Set "range.min/max" so that most realistic values are covered (for example, roughly -30% / +40% around your count, adjusted if necessary for scale).`;
 }
 
 /* =========================
