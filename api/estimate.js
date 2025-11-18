@@ -158,7 +158,6 @@ function detectPlaceType(address = "", feature = "") {
 
 /* =========================
    ベースライン人数推定（サーバー側・シンプル）
-   - ここで「現実的なオーダー」を決める
 ========================= */
 function baselineEstimate(input, nationalityFilter = "all") {
   const time = parseLocalTimeInfo(input.local_time_iso);
@@ -197,9 +196,9 @@ function baselineEstimate(input, nationalityFilter = "all") {
 
   let nationalityFactor = 1;
   if (nationalityFilter === "japanese_only") {
-    nationalityFactor = 0.85; // 日本人のみ: だいたい全体の8〜9割
+    nationalityFactor = 0.85;
   } else if (nationalityFilter === "foreigner_only") {
-    nationalityFactor = 0.15; // 外国人のみ: 都市部で1〜2割程度を想定
+    nationalityFactor = 0.15;
   }
 
   let expected =
@@ -224,57 +223,25 @@ function baselineEstimate(input, nationalityFilter = "all") {
 }
 
 /* =========================
-   プロンプト（できるだけ短い日本語プロンプト＋自己検証プロセス）
+   極端に短いプロンプト
+   - ①住所, ②混雑度, ③特徴, ④半径 の4つだけを条件としてAIに渡す
 ========================= */
-function buildPrompt(input, targetLang, nationalityFilter, baseline) {
-  const { address, crowd, feature, radius_m, local_time_iso } = input;
+function buildPrompt(input) {
+  const { address, crowd, feature, radius_m } = input;
 
-  const radius_km = radius_m / 1000;
+  // できるだけ短く、条件も4つだけ
+  return `
+You are an AI that estimates how many people there are.
 
-  // おおまかなスケールヒント（日本全体・地球全体などをAIに伝える用、短く）
-  let scaleHint = "local";
-  if (radius_km >= 5000) {
-    scaleHint = "earth";
-  } else if (radius_km >= 800) {
-    scaleHint = "country_or_large_region";
-  }
+Return JSON only:
+{"count":number,"confidence":number}
 
-  const area_km2 = baseline.area_km2;
-
-  return `あなたは人数を推定するAIです。以下の条件に当てはまる「人の人数」を、現実世界であり得るオーダーで推定してください。
-
-出力は必ず次のJSONのみとし、余計なテキストは一切書かないでください。
-{"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
-
-条件:
-- 対象: "feature" に当てはまる人。
-- 範囲: "address" を中心とした半径 radius_m メートルの円内。
-- crowd は混雑度の目安です（empty / normal / crowded）。
-- nationality_filter:
-  - "all": 国籍を問わず全員
-  - "japanese_only": 日本人のみ
-  - "foreigner_only": 日本人以外のみ
-- 半径が非常に大きい場合（約1000km以上や地球全体相当など）は、国全体や地球全体の人口規模を考慮した現実的な人数にしてください。
-- count は現実世界の人口を超えない範囲で、極端に小さすぎる値・大きすぎる値は避けてください。
-- confidence は 0〜1 の間の値にしてください。
-- assumptions と notes には、推定の理由や前提を簡潔に日本語で書いてください。
-
-自己検証プロセス（数値チェック）:
-- 半径 radius_m から計算される円の面積 area_km2（今回の概算: 約 ${area_km2.toFixed(
-    3
-  )} km^2）を用いて、人数密度 density = count / area_km2 を考え、駅前・住宅地・公園などとして極端に高すぎないか／低すぎないか確認してください。
-- 半径が非常に大きい場合（scale_hint が country_or_large_region や earth の場合）、対象地域の総人口を大きく超えていないか確認してください。
-- range.min ≤ count ≤ range.max になるよう、一貫した範囲になっているか確認してください。
-- 上記チェックで不自然だと感じた場合は、count や range を修正し、その理由を notes に1行以上必ず書いてください。
-
-入力情報:
+Conditions:
 - address: ${JSON.stringify(address)}
-- feature: ${JSON.stringify(feature)}
-- crowd: ${JSON.stringify(crowd)}
-- radius_m: ${radius_m}
-- local_time_iso: ${JSON.stringify(local_time_iso || baseline.timeIso || null)}
-- nationality_filter: ${JSON.stringify(nationalityFilter)}
-- scale_hint: ${JSON.stringify(scaleHint)}`;
+- crowd: ${JSON.stringify(crowd)}  // empty / normal / crowded
+- feature: ${JSON.stringify(feature)}  // people who match this description
+- radius_m: ${radius_m}  // meters around the address
+`.trim();
 }
 
 /* =========================
@@ -365,7 +332,6 @@ function neutralEstimate(input, nationalityFilter, targetLang) {
 
 /* =========================
    サーバー側の軽い補正
-   - AI出力がベースラインから大きくズレていれば 0.5x〜2.0x の範囲に収める
 ========================= */
 function serverAdjustWithBaseline(out, baseline, targetLang) {
   const bandLo = Math.round(baseline.expected * 0.5);
@@ -432,7 +398,7 @@ async function callXAIWithTimeout(messages, signal) {
     model: XAI_MODEL,
     messages,
     temperature: 0,
-    max_output_tokens: 400,
+    max_output_tokens: 200,
   };
 
   const resp = await fetch(XAI_URL, {
@@ -509,13 +475,8 @@ export default async function handler(req, res) {
     // ベースラインを先に計算
     const baseline = baselineEstimate(input, nationalityFilter);
 
-    // プロンプト
-    const prompt = buildPrompt(
-      input,
-      targetLang,
-      nationalityFilter,
-      baseline
-    );
+    // ★ 極端に短いプロンプト（4つの条件のみをAIに渡す）
+    const prompt = buildPrompt(input);
     console.log("[estimate] prompt:", prompt);
 
     const messages = [
@@ -608,4 +569,3 @@ export default async function handler(req, res) {
     return res.status(200).json(adjusted);
   }
 }
-
