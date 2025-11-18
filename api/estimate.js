@@ -224,109 +224,47 @@ function baselineEstimate(input, nationalityFilter = "all") {
 }
 
 /* =========================
-   プロンプト（シンプル版・大半径対応＆現実的スケール強調）
+   プロンプト（できるだけ短い日本語プロンプト）
 ========================= */
 function buildPrompt(input, targetLang, nationalityFilter, baseline) {
   const { address, crowd, feature, radius_m, local_time_iso } = input;
 
   const radius_km = radius_m / 1000;
-  const addressLower = String(address || "").toLowerCase();
 
-  // スケール判定: ローカル / 日本全体 / 地球全体 など
-  let scaleHint = "local"; // "local" | "large_region" | "japan_country" | "global_earth"
+  // おおまかなスケールヒント（日本全体・地球全体などをAIに伝える用、短く）
+  let scaleHint = "local";
   if (radius_km >= 5000) {
-    // ほぼ地球全体
-    scaleHint = "global_earth";
-  } else if (radius_km >= 800 && radius_km <= 3000) {
-    // 1000km 前後 → 日本全体レベルを想定
-    if (/日本|japan/.test(addressLower) || targetLang === "ja") {
-      scaleHint = "japan_country";
-    } else {
-      scaleHint = "large_region";
-    }
+    scaleHint = "earth";
+  } else if (radius_km >= 800) {
+    scaleHint = "country_or_large_region";
   }
 
-  // 人口の現実的な上限（おおよそ、2020年代中盤）
-  const japanTotalPopulationApprox = 1.23e8; // 約 1.23 億人
-  const worldTotalPopulationApprox = 8.2e9;  // 約 82 億人
+  return `あなたは人数を推定するAIです。以下の条件に当てはまる「人の人数」を、現実世界であり得るオーダーで推定してください。
 
-  return `You are an estimator. Output ONLY JSON, no prose.
-
-JSON schema (keys and types are fixed):
+出力は必ず次のJSONのみとし、余計なテキストは一切書かないでください。
 {"count":number,"confidence":number,"range":{"min":number,"max":number},"assumptions":string[],"notes":string[]}
 
-Rules:
-- Estimate how many PEOPLE match the description "feature" within a circle of radius_m meters around the address.
-- Nationality:
-  - If nationality_filter = "all": include everyone (Japanese and non-Japanese). Do NOT infer nationality from language.
-  - If "japanese_only": include only Japanese people.
-  - If "foreigner_only": include only non-Japanese (foreigners).
-- "crowd" is one of "empty" | "normal" | "crowded".
-- "assumptions" and "notes" MUST be written in "${targetLang}".
-- "confidence" is a float 0..1.
-- Respond with JSON only. No extra text.
+条件:
+- 対象: "feature" に当てはまる人。
+- 範囲: "address" を中心とした半径 radius_m メートルの円内。
+- crowd は混雑度の目安です（empty / normal / crowded）。
+- nationality_filter:
+  - "all": 国籍を問わず全員
+  - "japanese_only": 日本人のみ
+  - "foreigner_only": 日本人以外のみ
+- 半径が非常に大きい場合（約1000km以上や地球全体相当など）は、国全体や地球全体の人口規模を考慮した現実的な人数にしてください。
+- count は現実世界の人口を超えない範囲で、極端に小さすぎる値・大きすぎる値は避けてください。
+- confidence は 0〜1 の間の値にしてください。
+- assumptions と notes には、推定の理由や前提を簡潔に日本語で書いてください。
 
-Scale handling:
-- scale_hint = "local": treat this as a local area (city block, neighborhood, station area, etc.).
-- scale_hint = "large_region": treat this as a several-hundred-kilometer region (multiple cities or a large region).
-- scale_hint = "japan_country":
-  - Treat the circle as roughly covering the whole of Japan.
-  - Use a realistic total population for Japan in the mid-2020s: about ${Math.round(
-    japanTotalPopulationApprox
-  )} people.
-  - Your "count" MUST NEVER exceed this total population.
-  - When the feature is a subset (e.g. people eating, people wearing red clothes), your "count" should usually be a reasonable fraction of the total population (often a few percent or less), unless there is a very strong reason.
-- scale_hint = "global_earth":
-  - Treat the circle as covering almost the entire Earth.
-  - Use a realistic total world population in the mid-2020s: about ${Math.round(
-    worldTotalPopulationApprox
-  )} people.
-  - Your "count" MUST NEVER exceed this world population.
-  - For specific features, estimate a reasonable subset of the world population.
-
-Important realism guidance:
-- Use the baseline numbers below as a realistic ORDER OF MAGNITUDE.
-- Do NOT arbitrarily shrink the count far below the baseline without a clear, concrete reason.
-- If you are unsure, avoid obviously underestimating: it is better to stay around the baseline_expected_people or slightly above it than to output unrealistically small numbers.
-- Ensure that "range.min" and "range.max" remain consistent with realistic human populations for the given scale (local, country, global).
-
-Context:
+入力情報:
 - address: ${JSON.stringify(address)}
-- local_time_iso: ${JSON.stringify(local_time_iso || baseline.timeIso || null)}
-- time_slot: ${JSON.stringify(
-    baseline.timeSlot
-  )}  // morning_commute, lunch, evening_commute, night, etc.
-- place_type: ${JSON.stringify(
-    baseline.placeType
-  )} // station/airport/mall/park/residential/office/school/tourist/generic
-- crowd: ${JSON.stringify(crowd)}
 - feature: ${JSON.stringify(feature)}
+- crowd: ${JSON.stringify(crowd)}
 - radius_m: ${radius_m}
-- radius_km: ${radius_km.toFixed(3)}
-- scale_hint: ${JSON.stringify(
-    scaleHint
-  )} // "local" | "large_region" | "japan_country" | "global_earth"
+- local_time_iso: ${JSON.stringify(local_time_iso || baseline.timeIso || null)}
 - nationality_filter: ${JSON.stringify(nationalityFilter)}
-- japan_total_population_approx: ${japanTotalPopulationApprox}
-- world_total_population_approx: ${worldTotalPopulationApprox}
-
-Simple heuristic baseline (for your reference):
-- area_km2 ≈ ${baseline.area_km2.toFixed(4)}
-- base_density_people_per_km2 ≈ ${baseline.baseDensity}
-- time_factor ≈ ${baseline.timeFactor}
-- crowd_factor ≈ ${baseline.crowdFactor}
-- baseline_expected_people ≈ ${Math.round(
-    baseline.expected
-  )} (plausible band ${baseline.bandMin}〜${baseline.bandMax})
-
-Self-check guideline:
-- For local or regional scales ("local", "large_region"):
-  - Your "count" should normally stay within about 0.8x〜2.5x of baseline_expected_people.
-  - If you go outside that range, clearly explain the specific reasons in "notes".
-- For "japan_country" and "global_earth":
-  - First check that "count" is well below the total population when you are estimating a subset (specific activity, clothing, etc.).
-  - Then check that the order of magnitude is reasonable (for example, it would be unrealistic if only a tiny number of people matched a very common condition).
-- Set "range.min/max" so that most realistic values are covered (for example, roughly -30% / +40% around your count, adjusted if necessary for scale).`;
+- scale_hint: ${JSON.stringify(scaleHint)}`;
 }
 
 /* =========================
@@ -483,7 +421,7 @@ async function callXAIWithTimeout(messages, signal) {
   const body = {
     model: XAI_MODEL,
     messages,
-    temperature: 0.4,
+    temperature: 0,
     max_output_tokens: 400,
   };
 
