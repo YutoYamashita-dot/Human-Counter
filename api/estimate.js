@@ -187,9 +187,17 @@ function baselineEstimate(input, nationalityFilter = "all") {
   };
 
   const radius_km = Math.max(0, input.radius_m) / 1000;
-  const area_km2 = Math.PI * radius_km * radius_km;
+  let area_km2 = Math.PI * radius_km * radius_km;
 
-  const baseDensity = baselineByPlace[placeType] ?? baselineByPlace.generic;
+  const addrLower = String(input.address || "").toLowerCase();
+  const isJapanAddress =
+    /日本|tokyo|tokyo-to|tokyo metropolis|東京都|osaka|大阪|hokkaido|北海道|kyoto|京都|nagoya|名古屋|fukuoka|福岡|japan/.test(
+      addrLower
+    );
+  const isJapanWhole = isJapanAddress && radius_km === 1000;
+  const isWorldWhole = radius_km === 20000;
+
+  let baseDensity = baselineByPlace[placeType] ?? baselineByPlace.generic;
   const timeFactor = timeFactorMap[time.slot] ?? 0.8;
   const crowdFactor =
     input.crowd === "crowded" ? 2 : input.crowd === "normal" ? 1 : 0.5;
@@ -201,8 +209,25 @@ function baselineEstimate(input, nationalityFilter = "all") {
     nationalityFactor = 0.15;
   }
 
-  let expected =
-    area_km2 * baseDensity * timeFactor * crowdFactor * nationalityFactor;
+  let expected;
+
+  if (isJapanWhole || isWorldWhole) {
+    // ★ 特別ルール: 日本全体 / 世界全体をベースにする
+    const totalPop = isJapanWhole ? 125_000_000 : 8_200_000_000;
+    // 面積（ざっくり）：日本 約378,000 km2, 地球表面 約510,000,000 km2
+    area_km2 = isJapanWhole ? 378_000 : 510_000_000;
+
+    // 混雑度・時間帯を掛け合わせた「人口シェア」を0〜1にクリップ
+    let share = timeFactor * crowdFactor;
+    if (share > 1) share = 1;
+    if (share < 0.01) share = 0.01;
+
+    expected = totalPop * share * nationalityFactor;
+  } else {
+    expected =
+      area_km2 * baseDensity * timeFactor * crowdFactor * nationalityFactor;
+  }
+
   expected = Math.max(0, expected);
 
   const bandMin = Math.round(expected * 0.6);
@@ -225,11 +250,12 @@ function baselineEstimate(input, nationalityFilter = "all") {
 /* =========================
    極端に短いプロンプト
    - ①住所, ②混雑度, ③特徴, ④半径 の4つだけを条件としてAIに渡す
+   - 日本全体 / 世界全体の特別ルールと自己検証プロセスを追記
 ========================= */
 function buildPrompt(input) {
   const { address, crowd, feature, radius_m } = input;
+  const radius_km = radius_m / 1000;
 
-  // できるだけ短く、条件も4つだけ
   return `
 You are an AI that estimates how many people there are.
 
@@ -240,7 +266,16 @@ Conditions:
 - address: ${JSON.stringify(address)}
 - crowd: ${JSON.stringify(crowd)}  // empty / normal / crowded
 - feature: ${JSON.stringify(feature)}  // people who match this description
-- radius_m: ${radius_m}  // meters around the address
+- radius_m: ${radius_m}  // meters around the address (≈ ${radius_km} km)
+
+Special rules:
+- If the address is in Japan and radius_m is exactly 1000000 (1000km), treat the target as the whole of Japan and base your estimate on a total population of about 125000000 people.
+- If radius_m is exactly 20000000 (20000km), treat the target as the whole world and base your estimate on a total population of about 8200000000 people.
+
+Self-check:
+- If you used the "Japan" rule, make sure the count does not greatly exceed 125000000 people.
+- If you used the "World" rule, make sure the count does not exceed 8200000000 people.
+- Avoid extremely small values that are clearly unrealistic for that geographic scope.
 `.trim();
 }
 
@@ -475,7 +510,7 @@ export default async function handler(req, res) {
     // ベースラインを先に計算
     const baseline = baselineEstimate(input, nationalityFilter);
 
-    // ★ 極端に短いプロンプト（4つの条件のみをAIに渡す）
+    // ★ 極端に短いプロンプト（4つの条件＋日本/世界ルール＋自己検証）
     const prompt = buildPrompt(input);
     console.log("[estimate] prompt:", prompt);
 
