@@ -434,7 +434,7 @@ async function callXAIWithTimeout(messages, signal) {
     model: XAI_MODEL,
     messages,
     temperature: 0,
-    max_tokens: 200, // OpenAI Chat Completions 用のパラメータ名に変更
+    max_completion_tokens: 200, // OpenAI Chat Completions 用のパラメータ名に変更
   };
 
   const resp = await fetch(XAI_URL, {
