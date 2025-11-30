@@ -1,6 +1,6 @@
 // api/estimate.js
 // Vercel Node.js (ESM)。人の「特徴」や場所情報から人数をざっくり推定して返す。
-// バックエンドは OpenAI Responses API（gpt-5-mini）を使用。
+// バックエンドは OpenAI Chat Completions API（gpt-5-mini）を使用。
 
 export const config = { runtime: "nodejs" };
 
@@ -30,7 +30,7 @@ export default async function handler(req, res) {
     const body =
       typeof req.body === "string"
         ? JSON.parse(req.body || "{}")
-        : req.body || {};
+        : (req.body || {});
 
     const {
       address,              // 住所文字列（例: "東京都港区高輪3-26-27 品川駅周辺"）
@@ -39,7 +39,7 @@ export default async function handler(req, res) {
       place_type,           // 場所タイプ（駅 / オフィス街 / 住宅街 / 観光地 などの自由入力）
       features,             // 人の特徴（「食事中の人」「電車待ちの人」など）
       crowd_level,          // UI側の混雑度（任意: "空いている" / "普通" / "混雑" など）
-      max_completion_tokens // フロントから来る max_tokens 相当
+      max_completion_tokens // ← フロントから来る max_tokens 相当
     } = body;
 
     // モデルに渡すための入力まとめ
@@ -55,7 +55,7 @@ export default async function handler(req, res) {
       crowd_level: crowd_level || null,
     };
 
-    // max_tokens → max_output_tokens に渡す値
+    // max_tokens に渡す値（max_completion_tokens をそのまま使う）
     const DEFAULT_MAX_TOKENS = 400;
     const maxTokensForModel =
       typeof max_completion_tokens === "number" &&
@@ -67,7 +67,7 @@ export default async function handler(req, res) {
     // =========================
     // モデルへの指示（日本語）
     // temperature は 1 固定
-    // max_output_tokens は max_completion_tokens をそのまま使用
+    // max_tokens は max_completion_tokens をそのまま使用
     // JSON だけ返させるようにプロンプトで強制
     // =========================
     const systemPrompt = `
@@ -113,11 +113,12 @@ export default async function handler(req, res) {
       "必ず上で指定した JSON オブジェクトのみを返してください。\n\n" +
       JSON.stringify(inputForModel, null, 2);
 
-    const response = await client.responses.create({
+    // ★ Chat Completions API を使用（Responses API ではない）
+    const completion = await client.chat.completions.create({
       model: OPENAI_MODEL,
       temperature: 1,
-      max_output_tokens: maxTokensForModel,
-      input: [
+      max_tokens: maxTokensForModel, // ← ユーザー指定どおり max_completion_tokens をそのまま使用
+      messages: [
         {
           role: "system",
           content: systemPrompt.trim(),
@@ -127,11 +128,10 @@ export default async function handler(req, res) {
           content: userPrompt,
         },
       ],
-      // text.format や response_format は使わず、素のテキスト出力を JSON として解釈する
     });
 
-    // 公式 SDK のヘルパー。モデルからのテキスト出力を 1 つの文字列にまとめてくれる
-    const rawText = response.output_text ?? "";
+    const rawText =
+      completion.choices?.[0]?.message?.content?.trim() || "";
 
     let parsed;
     try {
