@@ -537,49 +537,95 @@ export default async function handler(req, res) {
       const xres = await callXAIWithTimeout(messages, controller.signal);
 clearTimeout(timer);
 
-// --- ここから変更 ---
-const msg = xres?.choices?.[0]?.message;
-let content = "";
+// ----- ここから内容を差し替え -----
+function extractContentFromOpenAIResponse(resp) {
+  if (!resp) return "";
 
-// ① 文字列としてそのまま入っているパターン
-if (typeof msg?.content === "string") {
-  content = msg.content;
+  // ① chat/completions 形式: choices[0].message.content
+  const choice0 = resp.choices && resp.choices[0];
+  if (choice0 && choice0.message) {
+    const msg = choice0.message;
 
-// ② 配列形式のパターン（新しいフォーマット）
-} else if (Array.isArray(msg?.content)) {
-  content = msg.content
-    .map((part) => {
-      // part が文字列のとき
-      if (typeof part === "string") return part;
+    // content が文字列パターン
+    if (typeof msg.content === "string") {
+      return msg.content;
+    }
 
-      // 旧来の { type: "text", text: "..." } 風
-      if (part?.type === "text" && typeof part.text === "string") {
-        return part.text;
-      }
+    // content が配列パターン
+    if (Array.isArray(msg.content)) {
+      return msg.content
+        .map((part) => {
+          if (!part) return "";
 
-      // 新しい { type: "output_text", text: { value: "..." } } 風
-      if (
-        part?.type === "output_text" &&
-        typeof part?.text?.value === "string"
-      ) {
-        return part.text.value;
-      }
+          // 文字列そのもの
+          if (typeof part === "string") return part;
 
-      return "";
-    })
-    .join(" ")
-    .trim();
+          // { type: "text", text: "..." }
+          if (part.type === "text" && typeof part.text === "string") {
+            return part.text;
+          }
 
-// ③ まれに { text: { value: "..." } } 直付けのパターン
-} else if (msg?.content?.text?.value) {
-  content = String(msg.content.text.value);
+          // { type: "output_text", text: { value: "..." } }
+          if (
+            part.type === "output_text" &&
+            part.text &&
+            typeof part.text.value === "string"
+          ) {
+            return part.text.value;
+          }
+
+          // { text: { value: "..." } } だけのパターン
+          if (part.text && typeof part.text.value === "string") {
+            return part.text.value;
+          }
+
+          return "";
+        })
+        .join(" ")
+        .trim();
+    }
+
+    // { content: { text: { value: "..." } } } みたいなパターン
+    if (msg.content && msg.content.text && typeof msg.content.text.value === "string") {
+      return msg.content.text.value;
+    }
+  }
+
+  // ② Responses API 形式: output[0].content[0].text
+  const out0 = (resp.output && resp.output[0]) || (resp.outputs && resp.outputs[0]);
+  if (out0 && out0.content) {
+    const parts = Array.isArray(out0.content) ? out0.content : [out0.content];
+    const text = parts
+      .map((part) => {
+        // { type: "output_text", text: { value: "..." } }
+        if (part.type === "output_text" && part.text && typeof part.text.value === "string") {
+          return part.text.value;
+        }
+        // { text: { value: "..." } }
+        if (part.text && typeof part.text.value === "string") {
+          return part.text.value;
+        }
+        // { type: "text", text: "..." }
+        if (part.type === "text" && typeof part.text === "string") {
+          return part.text;
+        }
+        return "";
+      })
+      .join(" ")
+      .trim();
+    if (text) return text;
+  }
+
+  // ③ どうしても見つからないときは空
+  return "";
 }
 
+const content = extractContentFromOpenAIResponse(xres);
 console.log("[estimate] content(raw extracted):", content);
-// --- ここまで変更 ---
+// ----- ここまで差し替え -----
 
 let data = tryParseJSON(content);
-if (!data) data = tryParseJSON(String(content));
+
       if (!data) data = tryParseJSON(String(content));
       let normalized;
 
