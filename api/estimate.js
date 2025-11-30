@@ -3,9 +3,9 @@ import { z } from "zod";
 
 export const config = { runtime: "nodejs" };
 
-// xAI API エンドポイント＆モデル
-const XAI_URL = "https://api.x.ai/v1/chat/completions";
-const XAI_MODEL = "grok-4-fast-reasoning"; // 例: grok-2-latest / grok-2-mini 等
+// xAI API エンドポイント＆モデル → ChatGPT (OpenAI) GPT-5 Mini を使用
+const XAI_URL = "https://api.openai.com/v1/chat/completions";
+const XAI_MODEL = "gpt-5-mini"; // ChatGPT 5 mini
 const TIMEOUT_MS = 30000;
 
 /* =========================
@@ -421,11 +421,12 @@ function serverAdjustWithBaseline(out, baseline, targetLang) {
 
 /* =========================
    xAI呼び出し（シンプル版）
+   ※中身だけ OpenAI ChatGPT (gpt-5-mini) 呼び出しに変更
 ========================= */
 async function callXAIWithTimeout(messages, signal) {
   if (!process.env.XAI_API_KEY) throw new Error("Missing XAI_API_KEY");
   const headers = {
-    Authorization: `Bearer ${process.env.XAI_API_KEY}`,
+    Authorization: `Bearer ${process.env.XAI_API_KEY}`, // ここに OpenAI の API Key をセット
     "Content-Type": "application/json",
   };
 
@@ -433,7 +434,7 @@ async function callXAIWithTimeout(messages, signal) {
     model: XAI_MODEL,
     messages,
     temperature: 0,
-    max_output_tokens: 200,
+    max_tokens: 200, // OpenAI Chat Completions 用のパラメータ名に変更
   };
 
   const resp = await fetch(XAI_URL, {
@@ -444,9 +445,9 @@ async function callXAIWithTimeout(messages, signal) {
   });
 
   const json = await resp.json().catch(() => ({}));
-  console.log("[estimate] raw xAI response:", JSON.stringify(json)?.slice(0, 800));
+  console.log("[estimate] raw xAI/OpenAI response:", JSON.stringify(json)?.slice(0, 800));
   if (!resp.ok) {
-    const msg = json?.error?.message || `xAI error: ${resp.status}`;
+    const msg = json?.error?.message || `xAI/OpenAI error: ${resp.status}`;
     throw new Error(msg);
   }
   return json;
@@ -554,7 +555,7 @@ export default async function handler(req, res) {
       return res.status(200).json(finalResult);
     } catch (e1) {
       clearTimeout(timer);
-      console.error("[estimate] xAI error:", e1);
+      console.error("[estimate] xAI/OpenAI error:", e1);
       const { out, baseline } = neutralEstimate(
         input,
         nationalityFilter,
