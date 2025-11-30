@@ -1,6 +1,6 @@
 // api/estimate.js
 // Vercel Node.js (ESM)。人の「特徴」や場所情報から人数をざっくり推定して返す。
-// バックエンドは OpenAI Responses API（gpt-5-mini 想定）を使用。
+// バックエンドは OpenAI Responses API（gpt-5-mini）を使用。
 
 export const config = { runtime: "nodejs" };
 
@@ -30,7 +30,7 @@ export default async function handler(req, res) {
     const body =
       typeof req.body === "string"
         ? JSON.parse(req.body || "{}")
-        : (req.body || {});
+        : req.body || {};
 
     const {
       address,              // 住所文字列（例: "東京都港区高輪3-26-27 品川駅周辺"）
@@ -39,7 +39,7 @@ export default async function handler(req, res) {
       place_type,           // 場所タイプ（駅 / オフィス街 / 住宅街 / 観光地 などの自由入力）
       features,             // 人の特徴（「食事中の人」「電車待ちの人」など）
       crowd_level,          // UI側の混雑度（任意: "空いている" / "普通" / "混雑" など）
-      max_completion_tokens // ← フロントから来る max_tokens 相当
+      max_completion_tokens // フロントから来る max_tokens 相当
     } = body;
 
     // モデルに渡すための入力まとめ
@@ -56,19 +56,19 @@ export default async function handler(req, res) {
     };
 
     // max_tokens → max_output_tokens に渡す値
-    const defaultMaxTokens = 400;
+    const DEFAULT_MAX_TOKENS = 400;
     const maxTokensForModel =
       typeof max_completion_tokens === "number" &&
       max_completion_tokens > 0 &&
       max_completion_tokens <= 4000
         ? max_completion_tokens
-        : defaultMaxTokens;
+        : DEFAULT_MAX_TOKENS;
 
     // =========================
     // モデルへの指示（日本語）
     // temperature は 1 固定
     // max_output_tokens は max_completion_tokens をそのまま使用
-    // JSON だけ返させるために text.format: "json" を指定
+    // JSON だけ返させるようにプロンプトで強制
     // =========================
     const systemPrompt = `
 あなたは、位置情報・時間帯・場所の種類などから
@@ -92,7 +92,7 @@ export default async function handler(req, res) {
 - crowd_level が「混雑」であれば、ベースの人数をやや増やすなど、直感的な補正のみ行う。
 
 【出力フォーマット】
-必ず次の JSON オブジェクト「だけ」を返してください（説明文などは一切書かない）:
+以下の JSON オブジェクト「1つだけ」を、余計な文字や説明なしで返してください。
 
 {
   "estimated_count": number,     // features に該当する人の中心的な推定値（0以上の現実的な人数）
@@ -102,13 +102,15 @@ export default async function handler(req, res) {
   "reason": string               // なぜその人数になったのか、日本語で1〜3文ほどの短い説明
 }
 
-数値は大きめでも小さめでも構いませんが、
-- 半径、場所タイプ、時間帯、特徴 から、人間レベルで「まあありそう」と思える範囲にしてください。
+【重要】
+- 必ず有効な JSON のみを返してください。
+- JSON の前後に説明文やコードブロック（\`\`\`json など）を絶対に付けないでください。
+- キー名や構造は上記と完全に一致させてください。
 `;
 
     const userPrompt =
       "以下の条件で、半径内にいる「features に当てはまる人」の人数を推定してください。" +
-      "必ず上記で指定した JSON オブジェクトのみを返してください。\n\n" +
+      "必ず上で指定した JSON オブジェクトのみを返してください。\n\n" +
       JSON.stringify(inputForModel, null, 2);
 
     const response = await client.responses.create({
@@ -125,22 +127,17 @@ export default async function handler(req, res) {
           content: userPrompt,
         },
       ],
-      // ★ Responses API では response_format は使わず、こちら
-      text: {
-        format: "json", // モデルに JSON 文字列のみを返させる指定
-      },
+      // text.format や response_format は使わず、素のテキスト出力を JSON として解釈する
     });
 
-    const rawText =
-      response.output?.[0]?.content?.[0]?.text ??
-      response.output_text ??
-      "";
+    // 公式 SDK のヘルパー。モデルからのテキスト出力を 1 つの文字列にまとめてくれる
+    const rawText = response.output_text ?? "";
 
     let parsed;
     try {
       parsed = rawText ? JSON.parse(rawText) : null;
     } catch (e) {
-      // もし JSON で返ってこなかった場合はデバッグ用に raw を返す
+      // JSON になっていなかった場合は、そのままデバッグ用情報を返す
       parsed = {
         parse_error: e instanceof Error ? e.message : "JSON parse error",
         raw: rawText,
