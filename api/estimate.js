@@ -435,6 +435,8 @@ async function callXAIWithTimeout(messages, signal) {
     messages,
     temperature: 1,
     max_completion_tokens: 200, // OpenAI Chat Completions 用のパラメータ名に変更
+    response_format: { type: "json_object" },
+
   };
 
   const resp = await fetch(XAI_URL, {
@@ -516,9 +518,14 @@ export default async function handler(req, res) {
     console.log("[estimate] prompt:", prompt);
 
     const messages = [
-      { role: "system", content: "Return JSON only." },
-      { role: "user", content: prompt },
-    ];
+  {
+    role: "system",
+    content:
+      "You are a JSON API. Reply ONLY with a single JSON object like {\"count\":123,\"confidence\":0.8}. " +
+      "Do NOT include any explanation, markdown, or text before or after the JSON."
+  },
+  { role: "user", content: prompt },
+];
 
     const controller = new AbortController();
     const timer = setTimeout(
