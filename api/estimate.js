@@ -1,699 +1,196 @@
-// api/estimate.js  (Vercel Node.js Serverless Function)
-import { z } from "zod";
+// api/estimate.js
+// Vercel Node.js (ESM)。人の「特徴」や場所情報から人数をざっくり推定して返す。
+// バックエンドは OpenAI gpt-5-mini（Responses API）を使用。
 
 export const config = { runtime: "nodejs" };
 
-// xAI API エンドポイント＆モデル → ChatGPT (OpenAI) GPT-5 Mini を使用
-const XAI_URL = "https://api.openai.com/v1/chat/completions";
-const XAI_MODEL = "gpt-5-mini"; // ChatGPT 5.1 mini
-const TIMEOUT_MS = 30000;
+import OpenAI from "openai";
 
 /* =========================
-   スキーマ定義
+   OpenAI クライアント設定
+   - 必須: OPENAI_API_KEY
+   - 任意: OPENAI_MODEL（未設定なら gpt-5-mini）
 ========================= */
-const CrowdJp = z.enum(["空いている", "普通", "混雑"]);
-const CrowdInternal = z.enum(["empty", "normal", "crowded"]);
-
-const Schema = z.object({
-  address: z
-    .string()
-    .transform((s) => (s ?? "").toString().trim())
-    .pipe(z.string().min(1).max(300)),
-  crowd: z
-    .union([CrowdJp, CrowdInternal])
-    .transform((v) =>
-      v === "空いている"
-        ? "empty"
-        : v === "普通"
-        ? "normal"
-        : v === "混雑"
-        ? "crowded"
-        : v
-    ),
-  feature: z
-    .string()
-    .transform((s) => (s ?? "").toString().trim())
-    .pipe(z.string().min(1).max(140)),
-  radius_m: z.coerce.number().int().min(10).max(40_075_000),
-  // UIから渡す現地時刻（ISO文字列: "YYYY-MM-DDTHH:mm:ss"）
-  local_time_iso: z.string().optional().nullable(),
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-/* =========================
-   言語判定
-========================= */
-function hasJapanese(s = "") {
-  return /[\u3040-\u30FF\u4E00-\u9FFF]/.test(String(s));
-}
-function detectTargetLang(req, body, input) {
-  // 優先度: 明示指定 > ヘッダー > 入力文字種 > 既定
-  const explicit = (
-    body?.lang ||
-    body?.ui_lang ||
-    body?.locale ||
-    ""
-  )
-    .toString()
-    .toLowerCase();
-  if (explicit === "ja" || explicit === "en") return explicit;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini"; // 公式モデルID 0
 
-  const h = (
-    req.headers?.["x-ui-lang"] ||
-    req.headers?.["accept-language"] ||
-    ""
-  )
-    .toString()
-    .toLowerCase();
-  if (h.startsWith("ja")) return "ja";
-  if (h.startsWith("en")) return "en";
-
-  if (
-    hasJapanese(body?.crowd) ||
-    hasJapanese(body?.feature) ||
-    hasJapanese(body?.address)
-  )
-    return "ja";
-  if (hasJapanese(input?.address) || hasJapanese(input?.feature)) return "ja";
-
-  return "en";
-}
-
-/* =========================
-   緩い正規化（スキーマ失敗時のフォールバック）
-========================= */
-function looseNormalize(input = {}) {
-  const addr = String(input?.address ?? "").trim() || "unknown";
-  const c = input?.crowd;
-  const crowd =
-    c === "混雑" || c === "crowded"
-      ? "crowded"
-      : c === "普通" || c === "normal"
-      ? "normal"
-      : "empty";
-  const feature = String(input?.feature ?? "").trim() || "people";
-  const r = Number(input?.radius_m ?? input?.radius ?? 500);
-  const radius_m = Number.isFinite(r)
-    ? Math.round(Math.max(10, Math.min(r, 40_075_000)))
-    : 500;
-  const local_time_iso =
-    (input?.local_time_iso && String(input.local_time_iso)) || null;
-  return { address: addr, crowd, feature, radius_m, local_time_iso };
-}
-
-/* =========================
-   国籍フィルタ
-========================= */
-function detectNationalityFilter(feature = "") {
-  const s = String(feature).toLowerCase();
-  if (/(non[-\s]?japanese|foreigner|foreigners|外国人)/.test(s))
-    return "foreigner_only";
-  if (/(japanese( people)?|日本人)/.test(s)) return "japanese_only";
-  return "all";
-}
-
-/* =========================
-   現地時間の解釈（時間帯/曜日）
-========================= */
-function parseLocalTimeInfo(local_time_iso) {
-  try {
-    if (!local_time_iso)
-      return { iso: null, hour: null, weekday: null, weekend: null, slot: "unknown" };
-    const d = new Date(local_time_iso);
-    if (isNaN(d.getTime()))
-      return { iso: null, hour: null, weekday: null, weekend: null, slot: "unknown" };
-    const hour = d.getHours(); // 0..23
-    const weekday = d.getDay(); // 0=Sun..6=Sat
-    const weekend = weekday === 0 || weekday === 6;
-
-    let slot = "daytime";
-    if (hour >= 7 && hour <= 9) slot = "morning_commute";
-    else if (hour >= 11 && hour <= 13) slot = "lunch";
-    else if (hour >= 17 && hour <= 20) slot = "evening_commute";
-    else if (hour >= 22 || hour <= 4) slot = "night";
-    else if (hour >= 5 && hour <= 6) slot = "early_morning";
-    else if (hour >= 10 && hour <= 16) slot = "daytime";
-    else slot = "other";
-
-    return { iso: d.toISOString(), hour, weekday, weekend, slot };
-  } catch {
-    return { iso: null, hour: null, weekday: null, weekend: null, slot: "unknown" };
-  }
-}
-
-/* =========================
-   場所タイプ推定（address/feature からヒューリスティック）
-========================= */
-function detectPlaceType(address = "", feature = "") {
-  const s = `${address} ${feature}`.toLowerCase();
-  if (/(station|駅|train|metro|subway|terminal)/.test(s)) return "station";
-  if (/(airport|空港)/.test(s)) return "airport";
-  if (/(mall|shopping|ショッピング|百貨店|デパート|商業|plaza|outlet)/.test(s)) return "mall";
-  if (/(park|公園|広場|square)/.test(s)) return "park";
-  if (/(residential|住宅|団地|apartment|マンション|戸建)/.test(s)) return "residential";
-  if (/(office|オフィス|ビジネス街|business district)/.test(s)) return "office";
-  if (/(school|大学|campus|学校|高校|小学校|中学校)/.test(s)) return "school";
-  if (/(temple|shrine|神社|寺|観光|tourist|観光地|観光客)/.test(s)) return "tourist";
-  return "generic";
-}
-
-/* =========================
-   ベースライン人数推定（サーバー側・シンプル）
-========================= */
-function baselineEstimate(input, nationalityFilter = "all") {
-  const time = parseLocalTimeInfo(input.local_time_iso);
-  const placeType = detectPlaceType(input.address, input.feature);
-
-  const baselineByPlace = {
-    station: 12000,
-    airport: 9000,
-    mall: 6000,
-    office: 4800,
-    school: 3200,
-    tourist: 4000,
-    residential: 2000,
-    park: 800,
-    generic: 2400,
-  };
-
-  const timeFactorMap = {
-    morning_commute: 1.6,
-    lunch: 1.3,
-    evening_commute: 1.7,
-    daytime: 1.0,
-    early_morning: 0.5,
-    night: 0.3,
-    other: 0.8,
-    unknown: 0.8,
-  };
-
-  const radius_km = Math.max(0, input.radius_m) / 1000;
-  let area_km2 = Math.PI * radius_km * radius_km;
-
-  const addrLower = String(input.address || "").toLowerCase();
-  const isJapanAddress =
-    /日本|tokyo|tokyo-to|tokyo metropolis|東京都|osaka|大阪|hokkaido|北海道|kyoto|京都|nagoya|名古屋|fukuoka|福岡|japan/.test(
-      addrLower
-    );
-  const isJapanWhole = isJapanAddress && radius_km === 1000;
-  const isWorldWhole = radius_km === 20000;
-
-  let baseDensity = baselineByPlace[placeType] ?? baselineByPlace.generic;
-  const timeFactor = timeFactorMap[time.slot] ?? 0.8;
-  const crowdFactor =
-    input.crowd === "crowded" ? 2 : input.crowd === "normal" ? 1 : 0.5;
-
-  let nationalityFactor = 1;
-  if (nationalityFilter === "japanese_only") {
-    nationalityFactor = 0.85;
-  } else if (nationalityFilter === "foreigner_only") {
-    nationalityFactor = 0.15;
-  }
-
-  let expected;
-
-  if (isJapanWhole || isWorldWhole) {
-    // ★ 特別ルール: 日本全体 / 世界全体をベースにする
-    const totalPop = isJapanWhole ? 125_000_000 : 8_200_000_000;
-    // 面積（ざっくり）：日本 約378,000 km2, 地球表面 約510,000,000 km2
-    area_km2 = isJapanWhole ? 378_000 : 510_000_000;
-
-    // 混雑度・時間帯を掛け合わせた「人口シェア」を0〜1にクリップ
-    let share = timeFactor * crowdFactor;
-    if (share > 1) share = 1;
-    if (share < 0.01) share = 0.01;
-
-    expected = totalPop * share * nationalityFactor;
-  } else {
-    expected =
-      area_km2 * baseDensity * timeFactor * crowdFactor * nationalityFactor;
-  }
-
-  expected = Math.max(0, expected);
-
-  const bandMin = Math.round(expected * 0.6);
-  const bandMax = Math.max(bandMin, Math.round(expected * 1.8));
-
-  return {
-    expected,
-    bandMin,
-    bandMax,
-    area_km2,
-    baseDensity,
-    timeFactor,
-    crowdFactor,
-    placeType,
-    timeSlot: time.slot,
-    timeIso: time.iso,
-  };
-}
-
-/* =========================
-   極端に短いプロンプト
-   - ①住所, ②混雑度, ③特徴, ④半径 の4つだけを条件としてAIに渡す
-   - 日本全体 / 世界全体の特別ルールと自己検証プロセスを追記
-========================= */
-function buildPrompt(input) {
-  const { address, crowd, feature, radius_m } = input;
-  const radius_km = radius_m / 1000;
-
-  return `
-You are an AI that estimates how many people there are.
-
-Return JSON only:
-{"count":number,"confidence":number}
-
-Conditions:
-- address: ${JSON.stringify(address)}
-- crowd: ${JSON.stringify(crowd)}  // empty / normal / crowded
-- feature: ${JSON.stringify(feature)}  // people who match this description
-- radius_m: ${radius_m}  // meters around the address (≈ ${radius_km} km)
-
-Special rules:
-- If the address is in Japan and radius_m is exactly 1000000 (1000km), treat the target as the whole of Japan and base your estimate on a total population of about 125000000 people.
-- If radius_m is exactly 20000000 (20000km), treat the target as the whole world and base your estimate on a total population of about 8200000000 people.
-
-Self-check:
-- If you used the "Japan" rule, make sure the count does not greatly exceed 125000000 people.
-- If you used the "World" rule, make sure the count does not exceed 8200000000 people.
-- Avoid extremely small values that are clearly unrealistic for that geographic scope.
-`.trim();
-}
-
-/* =========================
-   xAI返却の正規化
-========================= */
-function normalizeResult(data) {
-  const num = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
-  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-
-  const count = num(data?.count, 0);
-  const conf = clamp(num(data?.confidence, 0.6), 0, 1);
-  const rmin = num(data?.range?.min, Math.max(0, Math.round(count * 0.7)));
-  const rmax = num(
-    data?.range?.max,
-    Math.max(rmin, Math.round(count * 1.4))
-  );
-  const assumptions = Array.isArray(data?.assumptions)
-    ? data.assumptions.slice(0, 8)
-    : [];
-  const notes = Array.isArray(data?.notes) ? data.notes.slice(0, 8) : [];
-
-  return {
-    count: Math.max(0, Math.round(count)),
-    confidence: conf,
-    range: {
-      min: Math.max(0, Math.round(rmin)),
-      max: Math.max(0, Math.round(rmax)),
-    },
-    assumptions,
-    notes,
-  };
-}
-
-/* =========================
-   JSON抽出
-========================= */
-function tryParseJSON(content = "") {
-  if (typeof content !== "string") return null;
-  const fenced = content.match(/```json([\s\S]*?)```/i);
-  if (fenced && fenced[1]) {
-    try {
-      return JSON.parse(fenced[1].trim());
-    } catch {}
-  }
-  const first = content.indexOf("{");
-  const last = content.lastIndexOf("}");
-  if (first !== -1 && last !== -1 && last > first) {
-    const slice = content.slice(first, last + 1);
-    try {
-      return JSON.parse(slice);
-    } catch {}
-  }
-  try {
-    return JSON.parse(content);
-  } catch {}
-  return null;
-}
-
-/* =========================
-   ヒューリスティック推定（APIなし用）
-========================= */
-function neutralEstimate(input, nationalityFilter, targetLang) {
-  const baseline = baselineEstimate(input, nationalityFilter);
-  const est = Math.round(baseline.expected);
-  const spread = Math.round(est * 0.35 + 15);
-  const out = {
-    count: Math.max(0, est),
-    confidence: 0.55,
-    range: {
-      min: Math.max(0, est - spread),
-      max: est + spread,
-    },
-    assumptions:
-      targetLang === "ja"
-        ? ["場所タイプ・時間帯・混雑度からの簡易推定。"]
-        : ["Simple heuristic based on place type, time slot, and crowd level."],
-    notes:
-      targetLang === "ja"
-        ? [
-            `中立推定（API未使用）。期待値=${est}人、半径=${input.radius_m}m。`,
-          ]
-        : [
-            `Neutral heuristic estimate (no API). expected≈${est} people, radius=${input.radius_m}m.`,
-          ],
-  };
-  return { out, baseline };
-}
-
-/* =========================
-   サーバー側の軽い補正
-========================= */
-function serverAdjustWithBaseline(out, baseline, targetLang) {
-  const bandLo = Math.round(baseline.expected * 0.5);
-  const bandHi = Math.max(bandLo, Math.round(baseline.expected * 2.0));
-
-  let adjusted = { ...out };
-  let changed = false;
-
-  if (adjusted.count < bandLo) {
-    adjusted.count = bandLo;
-    changed = true;
-  } else if (adjusted.count > bandHi) {
-    adjusted.count = bandHi;
-    changed = true;
-  }
-
-  const spread = Math.round(adjusted.count * 0.35 + 10);
-  adjusted.range = {
-    min: Math.max(0, adjusted.count - spread),
-    max: adjusted.count + spread,
-  };
-
-  const notes = adjusted.notes ?? [];
-  const summaryLine =
-    targetLang === "ja"
-      ? `サーバー側簡易チェック: 期待オーダー≈${Math.round(
-          baseline.expected
-        )}人, 許容帯=[${bandLo}〜${bandHi}]`
-      : `Server-side simple check: expected order≈${Math.round(
-          baseline.expected
-        )} people, allowed=[${bandLo}..${bandHi}]`;
-
-  if (changed) {
-    notes.push(
-      summaryLine,
-      targetLang === "ja"
-        ? "AI推定値が許容帯から外れていたため、現実的な範囲に補正しました。"
-        : "AI estimate was outside the allowed band and was adjusted into a more realistic range."
-    );
-  } else {
-    notes.push(
-      summaryLine,
-      targetLang === "ja"
-        ? "AI推定値は許容帯の範囲内と判断されました。"
-        : "AI estimate was judged to be within the allowed band."
-    );
-  }
-
-  adjusted.notes = notes.slice(0, 10);
-  return adjusted;
-}
-
-/* =========================
-   xAI呼び出し（シンプル版）
-   ※中身だけ OpenAI ChatGPT (gpt-5-mini) 呼び出しに変更
-========================= */
-async function callXAIWithTimeout(messages, signal) {
-  if (!process.env.XAI_API_KEY) throw new Error("Missing XAI_API_KEY");
-  const headers = {
-    Authorization: `Bearer ${process.env.XAI_API_KEY}`, // ここに OpenAI の API Key をセット
-    "Content-Type": "application/json",
-  };
-
-  const body = {
-    model: XAI_MODEL,
-    messages,
-    temperature: 1,
-    max_completion_tokens: 200, // OpenAI Chat Completions 用のパラメータ名に変更
-    response_format: { type: "json_object" },
-
-  };
-
-  const resp = await fetch(XAI_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  const json = await resp.json().catch(() => ({}));
-  console.log("[estimate] raw xAI/OpenAI response:", JSON.stringify(json)?.slice(0, 800));
-  if (!resp.ok) {
-    const msg = json?.error?.message || `xAI/OpenAI error: ${resp.status}`;
-    throw new Error(msg);
-  }
-  return json;
-}
-
-/* =========================
-   ハンドラ
-========================= */
+/**
+ * Vercel Serverless Function エントリポイント
+ */
 export default async function handler(req, res) {
-  // CORS
-  if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-UI-Lang");
-    return res.status(204).end();
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  if (req.method !== "POST")
-    return res.status(405).json({ error: "Use POST" });
 
   try {
-    // 入力整形
-    let body = req.body;
-    if (typeof body === "string") {
-      try {
-        body = JSON.parse(body);
-      } catch {
-        body = {};
-      }
-    }
-    if (!body || typeof body !== "object") body = {};
+    // Vercel の設定次第で req.body が string のこともあるので吸収
+    const body =
+      typeof req.body === "string"
+        ? JSON.parse(req.body || "{}")
+        : req.body || {};
 
-    const incoming = {
-      ...body,
-      radius_m: body?.radius_m ?? body?.radius,
-      local_time_iso: body?.local_time_iso ?? body?.time ?? body?.localTime,
+    const {
+      address,              // 住所文字列（例: "東京都港区高輪3-26-27 品川駅周辺"）
+      radius_m,             // 半径（メートル）
+      local_time_iso,       // 現地時刻 ISO（例: "2025-11-30T20:15:00+09:00"）
+      place_type,           // 場所タイプ（駅 / オフィス街 / 住宅街 / 観光地 などの自由入力）
+      features,             // 人の特徴（「食事中の人」「電車待ちの人」など）
+      crowd_level,          // UI側の混雑度（任意: "空いている" / "普通" / "混雑" など）
+      max_completion_tokens // フロントから来る「max_tokens」の指定値として利用
+    } = body;
+
+    // モデルに渡すための入力まとめ（null/undefined を少し整理）
+    const inputForModel = {
+      address: address || "",
+      radius_m:
+        typeof radius_m === "number" && !Number.isNaN(radius_m)
+          ? radius_m
+          : null,
+      local_time_iso: local_time_iso || null,
+      place_type: place_type || null,
+      features: features || "",
+      crowd_level: crowd_level || null,
     };
 
-    let parsed = Schema.safeParse(incoming);
-    const input = parsed.success ? parsed.data : looseNormalize(incoming);
-    console.log("[estimate] input:", input);
+    const defaultMaxTokens = 400;
+    const maxTokensForModel =
+      typeof max_completion_tokens === "number" &&
+      max_completion_tokens > 0 &&
+      max_completion_tokens <= 4000
+        ? max_completion_tokens
+        : defaultMaxTokens;
 
-    const targetLang = detectTargetLang(req, body, input);
-    console.log("[estimate] targetLang:", targetLang);
+    // =========================
+    // モデルへの指示（日本語）
+    // temperature は 1 固定
+    // max_tokens は「max_completion_tokens」として body から受け取り、
+    // OpenAI の max_output_tokens にそのまま渡す。
+    // =========================
+    const systemPrompt = `
+あなたは、位置情報・時間帯・場所の種類などから「そのエリアに何人くらい人がいそうか」をラフに推定するアシスタントです。
 
-    const nationalityFilter = detectNationalityFilter(input.feature);
-    console.log("[estimate] nationalityFilter:", nationalityFilter);
+【タスク】
+- 入力として与えられた:
+  - address（住所・ランドマーク）
+  - radius_m（半径[m]）
+  - local_time_iso（現地時刻 ISO形式）
+  - place_type（駅 / オフィス街 / 住宅街 / 観光地 などの説明）
+  - features（例:「食事中の人」「電車待ちの人」「そのエリアに住んでいる人」など）
+  - crowd_level（「空いている」「普通」「混雑」など、もしあれば）
+- これらから、その半径内に「features に当てはまる人」がどのくらい居そうかを推定してください。
+- 完全な正解は不要ですが、あまりに非現実的な桁（例: 半径100mで1億人など）は避け、現実的なオーダーに収めてください。
+- 出力は必ず JSON 形式のみ、かつ指定のスキーマに従ってください（余計なキーを追加しない）。
 
-    // APIキー未設定 → 完全にヒューリスティックで返す
-    if (!process.env.XAI_API_KEY) {
-      console.warn("[estimate] missing XAI_API_KEY");
-      const { out, baseline } = neutralEstimate(
-        input,
-        nationalityFilter,
-        targetLang
-      );
-      const adjusted = serverAdjustWithBaseline(out, baseline, targetLang);
-      return res.status(200).json(adjusted);
-    }
+【推定の考え方の一例】
+- 大都市の駅前: 半径500mで数千〜数万人程度（時間帯・曜日・特徴によって変動）。
+- 住宅街: 夜間は「住んでいる人」の人数が多く、昼間は外出して減る。
+- 観光地: 休日や観光シーズンは平日より多い。
+- crowd_level が「混雑」であれば、ベースの人数をやや増やすなど、直感的な補正のみ行う。
 
-    // ベースラインを先に計算
-    const baseline = baselineEstimate(input, nationalityFilter);
+【出力スキーマ】
+- estimated_count: number
+    - features に該当する人の「中心的な推定値」。0以上の現実的な人数。
+- min_count: number
+    - 現実的にあり得そうな下限。
+- max_count: number
+    - 現実的にあり得そうな上限（min_count ≦ estimated_count ≦ max_count を目安に）。
+- crowd_label_jp: string
+    - 「空いている」「普通」「混雑」など、日本語で簡単に状況をまとめたラベル。
+- reason: string
+    - なぜその人数になったのか、日本語で1〜3文ほどの短い説明。
 
-    // ★ 極端に短いプロンプト（4つの条件＋日本/世界ルール＋自己検証）
-    const prompt = buildPrompt(input);
-    console.log("[estimate] prompt:", prompt);
+数値は大きめでも小さめでも構いませんが、
+- 半径、場所タイプ、時間帯、特徴 から、人間レベルで「まあありそう」と思える範囲にしてください。
+`;
 
-    const messages = [
-  {
-    role: "system",
-    content:
-      "You are a JSON API. Reply ONLY with a single JSON object like {\"count\":123,\"confidence\":0.8}. " +
-      "Do NOT include any explanation, markdown, or text before or after the JSON."
-  },
-  { role: "user", content: prompt },
-];
-
-    const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(new Error("timeout")),
-      TIMEOUT_MS
-    );
-
-    try {
-      const xres = await callXAIWithTimeout(messages, controller.signal);
-clearTimeout(timer);
-
-// ----- ここから内容を差し替え -----
-function extractContentFromOpenAIResponse(resp) {
-  if (!resp) return "";
-
-  // ① chat/completions 形式: choices[0].message.content
-  const choice0 = resp.choices && resp.choices[0];
-  if (choice0 && choice0.message) {
-    const msg = choice0.message;
-
-    // content が文字列パターン
-    if (typeof msg.content === "string") {
-      return msg.content;
-    }
-
-    // content が配列パターン
-    if (Array.isArray(msg.content)) {
-      return msg.content
-        .map((part) => {
-          if (!part) return "";
-
-          // 文字列そのもの
-          if (typeof part === "string") return part;
-
-          // { type: "text", text: "..." }
-          if (part.type === "text" && typeof part.text === "string") {
-            return part.text;
-          }
-
-          // { type: "output_text", text: { value: "..." } }
-          if (
-            part.type === "output_text" &&
-            part.text &&
-            typeof part.text.value === "string"
-          ) {
-            return part.text.value;
-          }
-
-          // { text: { value: "..." } } だけのパターン
-          if (part.text && typeof part.text.value === "string") {
-            return part.text.value;
-          }
-
-          return "";
-        })
-        .join(" ")
-        .trim();
-    }
-
-    // { content: { text: { value: "..." } } } みたいなパターン
-    if (msg.content && msg.content.text && typeof msg.content.text.value === "string") {
-      return msg.content.text.value;
-    }
-  }
-
-  // ② Responses API 形式: output[0].content[0].text
-  const out0 = (resp.output && resp.output[0]) || (resp.outputs && resp.outputs[0]);
-  if (out0 && out0.content) {
-    const parts = Array.isArray(out0.content) ? out0.content : [out0.content];
-    const text = parts
-      .map((part) => {
-        // { type: "output_text", text: { value: "..." } }
-        if (part.type === "output_text" && part.text && typeof part.text.value === "string") {
-          return part.text.value;
-        }
-        // { text: { value: "..." } }
-        if (part.text && typeof part.text.value === "string") {
-          return part.text.value;
-        }
-        // { type: "text", text: "..." }
-        if (part.type === "text" && typeof part.text === "string") {
-          return part.text;
-        }
-        return "";
-      })
-      .join(" ")
-      .trim();
-    if (text) return text;
-  }
-
-  // ③ どうしても見つからないときは空
-  return "";
-}
-
-const content = extractContentFromOpenAIResponse(xres);
-console.log("[estimate] content(raw extracted):", content);
-// ----- ここまで差し替え -----
-
-let data = tryParseJSON(content);
-
-      if (!data) data = tryParseJSON(String(content));
-      let normalized;
-
-      if (!data) {
-        console.warn("[estimate] parse failed, use neutral baseline");
-        const fallback = neutralEstimate(input, nationalityFilter, targetLang);
-        normalized = fallback.out;
-        baseline.expected = fallback.baseline.expected;
-      } else {
-        normalized = normalizeResult(data);
-      }
-
-      const finalResult = serverAdjustWithBaseline(
-        normalized,
-        baseline,
-        targetLang
-      );
-      console.log("[estimate] final result:", finalResult);
-      return res.status(200).json(finalResult);
-    } catch (e1) {
-      clearTimeout(timer);
-      console.error("[estimate] xAI/OpenAI error:", e1);
-      const { out, baseline } = neutralEstimate(
-        input,
-        nationalityFilter,
-        targetLang
-      );
-      const adjusted = serverAdjustWithBaseline(out, baseline, targetLang);
-      return res.status(200).json(adjusted);
-    }
-  } catch (err) {
-    console.error("[estimate] handler fatal:", err);
-    // フェイルセーフ: できるだけ入力からヒューリスティックで返す
-    const b = req?.body || {};
-    const r = Number(b?.radius_m ?? b?.radius ?? 500) || 500;
-    const c =
-      b?.crowd === "混雑" || b?.crowd === "crowded"
-        ? "crowded"
-        : b?.crowd === "普通" || b?.crowd === "normal"
-        ? "normal"
-        : "empty";
-
-    const rawInput = looseNormalize({
-      address: b?.address,
-      crowd: c,
-      feature: b?.feature,
-      radius_m: r,
-      local_time_iso: b?.local_time_iso ?? b?.time ?? b?.localTime,
+    // Responses API + Structured Outputs（JSON Schema） 1
+    const response = await client.responses.create({
+      model: OPENAI_MODEL,
+      temperature: 1, // ユーザー指定
+      max_output_tokens: maxTokensForModel, // 「max_tokens」は max_completion_tokens として扱う
+      input: [
+        {
+          role: "system",
+          content: systemPrompt.trim(),
+        },
+        {
+          role: "user",
+          content:
+            "以下の条件で、半径内にいる「features に当てはまる人」の人数を推定してください。" +
+            "必ず JSON のみを返してください。\n\n" +
+            JSON.stringify(inputForModel, null, 2),
+        },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "EstimateResponse",
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              estimated_count: {
+                type: "number",
+                description: "推定人数（0以上の現実的な値）",
+              },
+              min_count: {
+                type: "number",
+                description: "現実的な下限値",
+              },
+              max_count: {
+                type: "number",
+                description: "現実的な上限値",
+              },
+              crowd_label_jp: {
+                type: "string",
+                description: "混雑状況を示す日本語ラベル",
+              },
+              reason: {
+                type: "string",
+                description: "人数の根拠となる簡単な説明（日本語）",
+              },
+            },
+            required: [
+              "estimated_count",
+              "min_count",
+              "max_count",
+              "crowd_label_jp",
+              "reason",
+            ],
+          },
+        },
+      },
     });
 
-    const targetLang =
-      (b?.lang || b?.ui_lang || "")
-        .toString()
-        .toLowerCase()
-        .startsWith("ja") ||
-      hasJapanese(b?.feature) ||
-      hasJapanese(b?.address)
-        ? "ja"
-        : "en";
+    // Structured Outputs でも JSON 文字列が text として返ってくるのでパース
+    const rawText =
+      response.output?.[0]?.content?.[0]?.text ?? response.output_text ?? "";
 
-    const nationalityFilter = detectNationalityFilter(rawInput.feature);
-    const { out, baseline } = neutralEstimate(
-      rawInput,
-      nationalityFilter,
-      targetLang
-    );
-    const adjusted = serverAdjustWithBaseline(out, baseline, targetLang);
-    console.log("[estimate] emergency neutral:", adjusted);
-    return res.status(200).json(adjusted);
+    let parsed;
+    try {
+      parsed = rawText ? JSON.parse(rawText) : null;
+    } catch (e) {
+      // 万が一 JSON で返ってこなかった場合、デバッグ用に rawText を含めて返す
+      parsed = {
+        parse_error: e instanceof Error ? e.message : "JSON parse error",
+        raw: rawText,
+      };
+    }
+
+    return res.status(200).json({
+      ok: true,
+      model: OPENAI_MODEL,
+      input: inputForModel,
+      estimate: parsed,
+    });
+  } catch (err) {
+    console.error("[estimate] error", err);
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : "Internal Server Error",
+    });
   }
 }
