@@ -535,12 +535,51 @@ export default async function handler(req, res) {
 
     try {
       const xres = await callXAIWithTimeout(messages, controller.signal);
-      clearTimeout(timer);
+clearTimeout(timer);
 
-      const content = xres?.choices?.[0]?.message?.content ?? "";
-      console.log("[estimate] content:", content);
+// --- ここから変更 ---
+const msg = xres?.choices?.[0]?.message;
+let content = "";
 
-      let data = tryParseJSON(content);
+// ① 文字列としてそのまま入っているパターン
+if (typeof msg?.content === "string") {
+  content = msg.content;
+
+// ② 配列形式のパターン（新しいフォーマット）
+} else if (Array.isArray(msg?.content)) {
+  content = msg.content
+    .map((part) => {
+      // part が文字列のとき
+      if (typeof part === "string") return part;
+
+      // 旧来の { type: "text", text: "..." } 風
+      if (part?.type === "text" && typeof part.text === "string") {
+        return part.text;
+      }
+
+      // 新しい { type: "output_text", text: { value: "..." } } 風
+      if (
+        part?.type === "output_text" &&
+        typeof part?.text?.value === "string"
+      ) {
+        return part.text.value;
+      }
+
+      return "";
+    })
+    .join(" ")
+    .trim();
+
+// ③ まれに { text: { value: "..." } } 直付けのパターン
+} else if (msg?.content?.text?.value) {
+  content = String(msg.content.text.value);
+}
+
+console.log("[estimate] content(raw extracted):", content);
+// --- ここまで変更 ---
+
+let data = tryParseJSON(content);
+if (!data) data = tryParseJSON(String(content));
       if (!data) data = tryParseJSON(String(content));
       let normalized;
 
