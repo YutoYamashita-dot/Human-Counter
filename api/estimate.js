@@ -433,7 +433,7 @@ async function callXAIWithTimeout(messages, signal) {
   const body = {
     model: XAI_MODEL,
     messages,
-    temperature: 0,
+    temperature: 0.2,
     max_tokens: 200, // OpenAI Chat Completions 用のパラメータ名に変更
   };
 
