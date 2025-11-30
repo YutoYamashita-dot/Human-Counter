@@ -22,7 +22,7 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
  */
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
@@ -33,13 +33,13 @@ export default async function handler(req, res) {
         : (req.body || {});
 
     const {
-      address,              // 住所文字列（例: "東京都港区高輪3-26-27 品川駅周辺"）
+      address,              // 住所文字列
       radius_m,             // 半径（メートル）
-      local_time_iso,       // 現地時刻 ISO（例: "2025-11-30T20:15:00+09:00"）
-      place_type,           // 場所タイプ（駅 / オフィス街 / 住宅街 / 観光地 などの自由入力）
-      features,             // 人の特徴（「食事中の人」「電車待ちの人」など）
-      crowd_level,          // UI側の混雑度（任意: "空いている" / "普通" / "混雑" など）
-      max_completion_tokens // ← フロントから来る max_tokens 相当（ユーザー指定）
+      local_time_iso,       // 現地時刻 ISO
+      place_type,           // 場所タイプ（駅 / 住宅街など）
+      features,             // 人の特徴
+      crowd_level,          // 「空いている」「普通」「混雑」など
+      max_completion_tokens // フロントから来る max_tokens 相当
     } = body;
 
     // モデルに渡すための入力まとめ
@@ -66,9 +66,6 @@ export default async function handler(req, res) {
 
     // =========================
     // モデルへの指示（日本語）
-    // temperature は 1 固定
-    // max_completion_tokens は max_completion_tokens をそのまま使用
-    // JSON だけ返させるようにプロンプトで強制
     // =========================
     const systemPrompt = `
 あなたは、位置情報・時間帯・場所の種類などから
@@ -84,12 +81,6 @@ export default async function handler(req, res) {
   - crowd_level（「空いている」「普通」「混雑」など、もしあれば）
 - これらから、その半径内に「features に当てはまる人」がどのくらい居そうかを推定してください。
 - 完全な正解は不要ですが、あまりに非現実的な桁（例: 半径100mで1億人など）は避け、現実的なオーダーに収めてください。
-
-【推定の考え方の一例】
-- 大都市の駅前: 半径500mで数千〜数万人程度（時間帯・曜日・特徴によって変動）。
-- 住宅街: 夜間は「住んでいる人」の人数が多く、昼間は外出して減る。
-- 観光地: 休日や観光シーズンは平日より多い。
-- crowd_level が「混雑」であれば、ベースの人数をやや増やすなど、直感的な補正のみ行う。
 
 【出力フォーマット】
 以下の JSON オブジェクト「1つだけ」を、余計な文字や説明なしで返してください。
@@ -113,49 +104,78 @@ export default async function handler(req, res) {
       "必ず上で指定した JSON オブジェクトのみを返してください。\n\n" +
       JSON.stringify(inputForModel, null, 2);
 
-    // ★ Chat Completions API
+    // Chat Completions API（gpt-5-mini）
     const completion = await client.chat.completions.create({
       model: OPENAI_MODEL,
       temperature: 1,
-      // ここがポイント: max_tokens ではなく max_completion_tokens
+      // gpt-5 系モデルは max_tokens ではなく max_completion_tokens
       max_completion_tokens: maxTokensForModel,
       messages: [
-        {
-          role: "system",
-          content: systemPrompt.trim(),
-        },
-        {
-          role: "user",
-          content: userPrompt,
-        },
+        { role: "system", content: systemPrompt.trim() },
+        { role: "user", content: userPrompt },
       ],
     });
 
     const rawText =
       completion.choices?.[0]?.message?.content?.trim() || "";
 
+    // モデルから返ってきた JSON をパース
     let parsed;
     try {
       parsed = rawText ? JSON.parse(rawText) : null;
     } catch (e) {
-      // JSON になっていなかった場合は、そのままデバッグ用情報を返す
-      parsed = {
-        parse_error: e instanceof Error ? e.message : "JSON parse error",
-        raw: rawText,
-      };
+      // JSON になっていない場合は、とりあえず 0 人扱いで返す
+      parsed = null;
     }
 
-    return res.status(200).json({
-      ok: true,
-      model: OPENAI_MODEL,
-      input: inputForModel,
-      estimate: parsed,
-    });
+    // フロントのデータクラスに合わせて、
+    // ルートに必要なフィールドをフラットに並べる
+    const estimated = Number(parsed?.estimated_count) || 0;
+    const minCount =
+      typeof parsed?.min_count === "number"
+        ? parsed.min_count
+        : estimated;
+    const maxCount =
+      typeof parsed?.max_count === "number"
+        ? parsed.max_count
+        : estimated;
+
+    const responsePayload = {
+      // ここが重要: フロントが Required になっている confidence を必ず返す
+      // とりあえず「推定レンジの狭さ」から簡易的に計算（0〜1の間くらい）
+      confidence:
+        maxCount > minCount
+          ? Math.max(
+              0.1,
+              Math.min(
+                0.99,
+                1 - (maxCount - minCount) / (maxCount + 1)
+              )
+            )
+          : 0.7,
+
+      // 推定値関連
+      estimated_count: estimated,
+      min_count: minCount,
+      max_count: maxCount,
+
+      // 状況ラベルと理由
+      crowd_label_jp: parsed?.crowd_label_jp || "",
+      reason: parsed?.reason || "",
+    };
+
+    return res.status(200).json(responsePayload);
   } catch (err) {
     console.error("[estimate] error", err);
-    return res.status(500).json({
-      ok: false,
-      error: err instanceof Error ? err.message : "Internal Server Error",
+    // 失敗時もフロントのパーサが落ちないよう、必須フィールドを入れて返す
+    return res.status(200).json({
+      confidence: 0.0,
+      estimated_count: 0,
+      min_count: 0,
+      max_count: 0,
+      crowd_label_jp: "",
+      reason:
+        err instanceof Error ? err.message : "Internal Server Error",
     });
   }
 }
