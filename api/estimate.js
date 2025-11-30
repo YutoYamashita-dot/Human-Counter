@@ -5,7 +5,7 @@ export const config = { runtime: "nodejs" };
 
 // xAI API エンドポイント＆モデル → ChatGPT (OpenAI) GPT-5 Mini を使用
 const XAI_URL = "https://api.openai.com/v1/chat/completions";
-const XAI_MODEL = "gpt-5.1-mini"; // ChatGPT 5.1 mini
+const XAI_MODEL = "gpt-5-mini"; // ChatGPT 5.1 mini
 const TIMEOUT_MS = 30000;
 
 /* =========================
