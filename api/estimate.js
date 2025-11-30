@@ -1,7 +1,7 @@
 // api/estimate.js
 // Vercel Node.js (ESM)
 // 人の「特徴」や場所情報から人数をざっくり推定して返す。
-// OpenAI Chat Completions API (gpt-5-mini) を使用。
+// OpenAI Chat Completions API (gpt-5-mini) を JSON モードで使用。
 
 export const config = { runtime: "nodejs" };
 
@@ -18,42 +18,24 @@ const client = new OpenAI({
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 
-/**
- * モデルのテキスト出力から JSON 部分だけを抜き出してパース
- * （```json ... ``` などで返ってきても耐えるようにする）
- */
-function safeParseJsonFromText(text) {
-  if (!text) return null;
-
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    return null;
-  }
-  const jsonPart = text.slice(firstBrace, lastBrace + 1);
-  try {
-    return JSON.parse(jsonPart);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 入力情報からのシンプルなバックアップ推定ロジック
- * （モデル出力が使えない場合にのみ使用）
- */
+/* ------------------------------------------------
+ * バックアップ用の簡易推定ロジック
+ * （モデル出力がどうしても使えないときだけ使用）
+ * ------------------------------------------------ */
 function heuristicEstimate(input) {
-  const radiusM = typeof input.radius_m === "number" ? input.radius_m : 500;
-  const radiusKm = Math.max(0.05, radiusM / 1000); // 50m以上
+  const radiusM =
+    typeof input.radius_m === "number" && input.radius_m > 0
+      ? input.radius_m
+      : 1000;
+  const radiusKm = Math.max(0.05, radiusM / 1000); // 最低 50m
 
   const placeText = (input.place_type || input.address || "").toString();
   const crowdText = (input.crowd_level || "").toString();
   const featuresText = (input.features || "").toString();
 
-  // ベース人口密度 [人 / km^2]
-  let baseDensity = 8000; // デフォルト: 都市近郊
+  // ベース人口密度 [人/km^2]
+  let baseDensity = 8000;
   const lowerPlace = placeText.toLowerCase();
-
   if (lowerPlace.includes("駅") || lowerPlace.includes("station")) {
     baseDensity = 20000;
   } else if (
@@ -69,68 +51,76 @@ function heuristicEstimate(input) {
     baseDensity = 8000;
   } else if (
     lowerPlace.includes("観光") ||
-    lowerPlace.includes("tourist") ||
-    lowerPlace.includes("観光地")
+    lowerPlace.includes("tourist")
   ) {
     baseDensity = 12000;
-  } else if (
-    lowerPlace.includes("公園") ||
-    lowerPlace.includes("park")
-  ) {
+  } else if (lowerPlace.includes("公園") || lowerPlace.includes("park")) {
     baseDensity = 3000;
   }
 
   // 混雑度補正
+  const lowerCrowd = crowdText.toLowerCase();
   let crowdFactor = 1.0;
-  if (crowdText.containsAny(["空いている", "空き", "すいて"])) {
+  if (
+    lowerCrowd.includes("空いて") ||
+    lowerCrowd.includes("すいて") ||
+    lowerCrowd.includes("light")
+  ) {
     crowdFactor = 0.5;
-  } else if (crowdText.containsAny(["混雑", "混んで"])) {
+  } else if (
+    lowerCrowd.includes("混雑") ||
+    lowerCrowd.includes("混んで") ||
+    lowerCrowd.includes("crowded")
+  ) {
     crowdFactor = 1.5;
   }
 
-  // 特徴補正（「食事中」「走っている」など → 全体の一部）
+  // 特徴補正
   let featureFactor = 1.0;
   if (featuresText.trim().length > 0) {
-    featureFactor = 0.25; // デフォルトで全体の25%くらい
-    const lowerFeat = featuresText.toLowerCase();
-    if (lowerFeat.includes("芸能") || lowerFeat.includes("celebrity")) {
-      featureFactor = 0.001; // 芸能人はかなり少なめ
+    featureFactor = 0.25;
+    const lf = featuresText.toLowerCase();
+    if (lf.includes("芸能") || lf.includes("celebrity")) {
+      featureFactor = 0.001;
     }
   }
 
-  // 面積 [km^2]
   const areaKm2 = Math.PI * radiusKm * radiusKm;
+  let estimated = Math.round(
+    baseDensity * areaKm2 * crowdFactor * featureFactor
+  );
+  if (!Number.isFinite(estimated) || estimated < 0) estimated = 0;
 
-  // 推定人数
-  let estimated = Math.round(baseDensity * areaKm2 * crowdFactor * featureFactor);
-  if (!Number.isFinite(estimated) || estimated < 0) {
-    estimated = 0;
-  }
-
-  // 範囲と信頼度
   const min = Math.max(0, Math.round(estimated * 0.5));
   const max = Math.max(min, Math.round(estimated * 1.5));
   const confidence = estimated === 0 ? 0.3 : 0.7;
 
-  const assumptions = [
-    `半径${radiusKm.toFixed(2)}km、場所タイプと混雑度から単純な人口密度モデルで推定しました。`,
-  ];
-  const notes = [
-    "この値はあくまで概算であり、実際の人数とは大きく異なる可能性があります。",
-  ];
-
-  return { count: estimated, range: { min, max }, confidence, assumptions, notes };
+  return {
+    count: estimated,
+    range: { min, max },
+    confidence,
+    assumptions: [
+      `半径${radiusKm.toFixed(
+        2
+      )}km、場所タイプと混雑度から単純な人口密度モデルで概算しました。`,
+    ],
+    notes: [
+      "この値はバックエンド側の簡易モデルによる概算であり、実際の人数とは大きく異なる可能性があります。",
+    ],
+  };
 }
 
-// String.prototype 拡張（簡易 containsAny）
-String.prototype.containsAny = function (arr) {
-  const lower = this.toString().toLowerCase();
-  return arr.some((w) => lower.includes(w.toLowerCase()));
-};
+/* 数値っぽいものを number に正規化 */
+function numOrNull(v) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
+}
 
-/**
- * Vercel Serverless Function エントリポイント
- */
+/* ------------------------------------------------
+ * Vercel Serverless Function
+ * ------------------------------------------------ */
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -140,7 +130,7 @@ export default async function handler(req, res) {
     const body =
       typeof req.body === "string"
         ? JSON.parse(req.body || "{}")
-        : (req.body || {});
+        : req.body || {};
 
     const {
       address,
@@ -172,6 +162,7 @@ export default async function handler(req, res) {
         ? max_completion_tokens
         : DEFAULT_MAX_TOKENS;
 
+    /* ===== モデルへの指示（JSONモード） ===== */
     const systemPrompt = `
 あなたは、位置情報・時間帯・場所の種類などから
 「そのエリアに何人くらい人がいそうか」をラフに推定するアシスタントです。
@@ -181,15 +172,15 @@ export default async function handler(req, res) {
 - radius_m: 半径[m]
 - local_time_iso: 現地時刻（ISO形式）
 - place_type: 駅 / オフィス街 / 住宅街 / 観光地 など
-- features: 「黒い服を着ている」「食事中の人」など特徴
-- crowd_level: 「空いている」「普通」「混雑」など（あれば）
+- features: 「食事中の人」「黒い服を着ている人」など特徴
+- crowd_level: 「空いている」「普通」「混雑」など（任意）
 
 【タスク】
 - 半径内で「features に当てはまる人」がどのくらい居そうかを推定する。
 - 現実的なオーダー感（桁）に収めること。
 
 【出力フォーマット】
-必ず次の JSON オブジェクト「だけ」を返してください。
+必ず次の JSON オブジェクトだけを返してください:
 
 {
   "count": number | null,
@@ -203,95 +194,102 @@ export default async function handler(req, res) {
 }
 
 ※ 日本語で書くのは assumptions / notes だけで構いません。
-※ この JSON 以外の文字（説明文、コメント、コードブロック \`\`\` 等）は一切出力しないこと。
 `;
 
     const userPrompt =
       "以下の条件で人数を推定し、指定された JSON オブジェクトのみを返してください。\n\n" +
       JSON.stringify(inputForModel, null, 2);
 
-    // モデル呼び出し
+    // Chat Completions API（JSON モード）
     const completion = await client.chat.completions.create({
       model: OPENAI_MODEL,
       temperature: 1,
       max_completion_tokens: maxTokensForModel,
+      response_format: { type: "json_object" }, // ★ JSON 強制モード
       messages: [
         { role: "system", content: systemPrompt.trim() },
         { role: "user", content: userPrompt },
       ],
     });
 
-    const rawText =
-      completion.choices?.[0]?.message?.content?.trim() || "";
+    const raw = completion.choices?.[0]?.message?.content ?? "";
+    let parsed = null;
 
-    // --- モデルからの JSON を解析 ---
-    let parsed = safeParseJsonFromText(rawText);
+    try {
+      parsed = raw ? JSON.parse(raw) : null;
+    } catch {
+      parsed = null;
+    }
 
-    // parsed が使い物にならない場合はバックアップ推定
     let finalResult;
-    if (
-      !parsed ||
-      typeof parsed.count !== "number" ||
-      !parsed.range ||
-      typeof parsed.range.min !== "number" ||
-      typeof parsed.range.max !== "number"
-    ) {
+
+    if (!parsed || typeof parsed !== "object") {
+      // JSON 自体が取れなかったときだけバックアップロジック
       finalResult = heuristicEstimate(inputForModel);
     } else {
-      // モデル出力をそのまま使いつつ、最低限の補正
-      const count =
-        typeof parsed.count === "number" && parsed.count >= 0
-          ? Math.round(parsed.count)
-          : null;
+      // === モデルの値を最大限利用しつつ補正 ===
+      let count = numOrNull(parsed.count);
 
-      const min =
-        typeof parsed.range.min === "number" && parsed.range.min >= 0
-          ? Math.round(parsed.range.min)
-          : 0;
-      const max =
-        typeof parsed.range.max === "number" && parsed.range.max >= min
-          ? Math.round(parsed.range.max)
-          : Math.max(min, count ?? min);
+      let min = parsed.range ? numOrNull(parsed.range.min) : null;
+      let max = parsed.range ? numOrNull(parsed.range.max) : null;
 
-      const confRaw =
-        typeof parsed.confidence === "number" ? parsed.confidence : 0.0;
-      const autoConf =
-        max > min
-          ? Math.max(
-              0.1,
-              Math.min(0.99, 1 - (max - min) / (max + 1))
-            )
-          : 0.7;
-      const confidence =
-        confRaw > 0 && confRaw <= 1 ? confRaw : autoConf;
+      if (min === null && max === null && count !== null) {
+        // 範囲が無い場合は count ±30% で作る
+        min = Math.max(0, Math.round(count * 0.7));
+        max = Math.max(min, Math.round(count * 1.3));
+      }
 
-      const assumptions =
-        Array.isArray(parsed.assumptions)
+      if (count === null && min !== null && max !== null) {
+        // count が無い場合は範囲の中心を count にする
+        count = Math.round((min + max) / 2);
+      }
+
+      // まだ決まらない／完全におかしい場合はバックアップに切り替え
+      if (
+        count === null ||
+        min === null ||
+        max === null ||
+        max < min
+      ) {
+        finalResult = heuristicEstimate(inputForModel);
+      } else {
+        const confRaw = Number(parsed.confidence);
+        const autoConf =
+          max > min
+            ? Math.max(
+                0.1,
+                Math.min(0.99, 1 - (max - min) / (max + 1))
+              )
+            : 0.7;
+        const confidence =
+          Number.isFinite(confRaw) && confRaw > 0 && confRaw <= 1
+            ? confRaw
+            : autoConf;
+
+        const assumptions = Array.isArray(parsed.assumptions)
           ? parsed.assumptions.map((x) => String(x))
           : [];
-      const notes =
-        Array.isArray(parsed.notes)
+        const notes = Array.isArray(parsed.notes)
           ? parsed.notes.map((x) => String(x))
           : [];
 
-      // count が null なら、範囲の中心を使う
-      const safeCount =
-        count !== null ? count : Math.round((min + max) / 2);
-
-      finalResult = {
-        count: safeCount,
-        range: { min, max },
-        confidence,
-        assumptions,
-        notes,
-      };
+        finalResult = {
+          count: Math.round(count),
+          range: {
+            min: Math.round(min),
+            max: Math.round(max),
+          },
+          confidence,
+          assumptions,
+          notes,
+        };
+      }
     }
 
     return res.status(200).json(finalResult);
   } catch (err) {
     console.error("[estimate] error", err);
-
-    // 失敗時でもフロントのデコードが落ちないよう、同じ構造で返す
+    // 失敗時もフロントの JSON 形を維持
     return res.status(200).json({
       count: 0,
       range: { min: 0, max: 0 },
