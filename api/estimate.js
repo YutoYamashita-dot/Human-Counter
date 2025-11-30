@@ -39,7 +39,7 @@ export default async function handler(req, res) {
       place_type,           // 場所タイプ（駅 / オフィス街 / 住宅街 / 観光地 などの自由入力）
       features,             // 人の特徴（「食事中の人」「電車待ちの人」など）
       crowd_level,          // UI側の混雑度（任意: "空いている" / "普通" / "混雑" など）
-      max_completion_tokens // ← フロントから来る max_tokens 相当
+      max_completion_tokens // ← フロントから来る max_tokens 相当（ユーザー指定）
     } = body;
 
     // モデルに渡すための入力まとめ
@@ -55,7 +55,7 @@ export default async function handler(req, res) {
       crowd_level: crowd_level || null,
     };
 
-    // max_tokens に渡す値（max_completion_tokens をそのまま使う）
+    // max_completion_tokens に渡す値
     const DEFAULT_MAX_TOKENS = 400;
     const maxTokensForModel =
       typeof max_completion_tokens === "number" &&
@@ -67,7 +67,7 @@ export default async function handler(req, res) {
     // =========================
     // モデルへの指示（日本語）
     // temperature は 1 固定
-    // max_tokens は max_completion_tokens をそのまま使用
+    // max_completion_tokens は max_completion_tokens をそのまま使用
     // JSON だけ返させるようにプロンプトで強制
     // =========================
     const systemPrompt = `
@@ -113,11 +113,12 @@ export default async function handler(req, res) {
       "必ず上で指定した JSON オブジェクトのみを返してください。\n\n" +
       JSON.stringify(inputForModel, null, 2);
 
-    // ★ Chat Completions API を使用（Responses API ではない）
+    // ★ Chat Completions API
     const completion = await client.chat.completions.create({
       model: OPENAI_MODEL,
       temperature: 1,
-      max_tokens: maxTokensForModel, // ← ユーザー指定どおり max_completion_tokens をそのまま使用
+      // ここがポイント: max_tokens ではなく max_completion_tokens
+      max_completion_tokens: maxTokensForModel,
       messages: [
         {
           role: "system",
