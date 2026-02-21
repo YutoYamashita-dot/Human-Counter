@@ -1,22 +1,23 @@
 // api/estimate.js
 // Vercel Node.js (ESM)
 // 人の「特徴」や場所情報から人数をざっくり推定して返す。
-// OpenAI Chat Completions API (gpt-5-mini) を JSON モードで使用。
+// Gemini API を OpenAI 互換モードで使用。
 
 export const config = { runtime: "nodejs" };
 
 import OpenAI from "openai";
 
 /* =========================
-   OpenAI クライアント設定
-   - 必須: OPENAI_API_KEY
-   - 任意: OPENAI_MODEL（未設定なら gpt-5-mini）
+   Gemini (OpenAI互換) クライアント設定
+   - 必須: GEMINI_API_KEY
+   - 任意: GEMINI_MODEL（未設定なら gemini-3-flash-preview）
 ========================= */
 const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.GEMINI_API_KEY,
+  baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
 });
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
+const OPENAI_MODEL = process.env.GEMINI_MODEL || "gemini-3-flash-preview";
 
 /* ------------------------------------------------
  * バックアップ用の簡易推定ロジック
